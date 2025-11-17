@@ -10,6 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/yaml"
 )
 
 // PodmanContainer represents a container from Podman JSON output
@@ -26,6 +27,7 @@ type PodmanContainer struct {
 	Mounts        []string               `json:"Mounts"`
 	Names         []string               `json:"Names"`
 	Pid           int                    `json:"Pid"`
+	Pod           string                 `json:"Pod"`
 	Ports         interface{}            `json:"Ports"`
 	Restarts      int                    `json:"Restarts"`
 	StartedAt     int64                  `json:"StartedAt"`
@@ -48,7 +50,7 @@ func NewPodStorage() *PodStorage {
 
 // getPodmanContainers calls podman ps --format json to get running containers
 func (ps *PodStorage) getPodmanContainers() ([]PodmanContainer, error) {
-	cmd := exec.Command("podman", "ps", "--format", "json")
+	cmd := exec.Command("podman", "ps", "--format", "json", "--all")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("failed to run podman ps: %v", err)
@@ -60,6 +62,22 @@ func (ps *PodStorage) getPodmanContainers() ([]PodmanContainer, error) {
 	}
 
 	return containers, nil
+}
+
+// getPodmanK8sContainer calls podman kube generate NAME to get the container details
+func (ps *PodStorage) getPodmanK8sContainer(containerName string) (*corev1.Pod, error) {
+	cmd := exec.Command("podman", "kube", "generate", "-t", "pod", containerName)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run podman kube generate: %v", err)
+	}
+
+	var pod corev1.Pod
+	if err := yaml.Unmarshal(output, &pod); err != nil {
+		return nil, fmt.Errorf("failed to parse YAML output: %v", err)
+	}
+
+	return &pod, nil
 }
 
 // getPodmanContainer gets details for a specific container by ID
@@ -82,6 +100,8 @@ func (ps *PodStorage) getPodmanContainer(containerID string) (*PodmanContainer, 
 func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.Pod {
 	// Use the first name as pod name, fall back to truncated container ID
 	podName := "unknown"
+	podNamespace := ps.namespace
+
 	if len(container.Names) > 0 {
 		podName = container.Names[0]
 	} else {
@@ -91,6 +111,34 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 		} else {
 			podName = container.Id
 		}
+	}
+
+	// generate the podSpec
+	var podSpec corev1.PodSpec
+
+	if container.Pod == "" {
+		podmanPod, err := ps.getPodmanK8sContainer(container.Id)
+		if err != nil {
+			klog.Warningf("Failed to get detailed pod spec from podman for id=%s: %v", container.Id, err)
+		} else {
+			podSpec = podmanPod.Spec
+		}
+
+		if container.State == "exited" {
+			podNamespace = "containers-exited"
+		}
+	} else {
+		return nil
+		podSpec = corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:    podName, // Use the same name as the pod
+					Image:   container.Image,
+					Command: container.Command,
+				},
+			},
+		}
+		podNamespace = "pods"
 	}
 
 	// Convert Podman state to Kubernetes phase
@@ -150,22 +198,14 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
-			Namespace: ps.namespace,
+			Namespace: podNamespace,
 			Labels:    container.Labels, // Use Podman labels directly
 			Annotations: map[string]string{
 				"podman.io/container-id": container.Id,
 				"podman.io/image-id":     container.ImageID,
 			},
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:    podName, // Use the same name as the pod
-					Image:   container.Image,
-					Command: container.Command,
-				},
-			},
-		},
+		Spec: podSpec,
 		Status: corev1.PodStatus{
 			Phase:      phase,
 			Conditions: conditions,
@@ -192,6 +232,10 @@ func (ps *PodStorage) List(namespace, labelSelector, fieldSelector string) (*cor
 	var pods []corev1.Pod
 	for _, container := range containers {
 		pod := ps.podmanContainerToPod(&container)
+
+		if pod == nil {
+			continue
+		}
 
 		// Filter by namespace if specified
 		if namespace != "" && pod.Namespace != namespace {
