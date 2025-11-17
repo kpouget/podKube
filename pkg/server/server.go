@@ -58,6 +58,15 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api", s.handleAPIDiscovery)
 	mux.HandleFunc("/apis", s.handleAPIsDiscovery)
 	mux.HandleFunc("/api/v1", s.handleAPIV1Discovery)
+	mux.HandleFunc("/apis/project.openshift.io/v1", s.handleProjectAPIDiscovery)
+
+	// Namespace API endpoints
+	mux.HandleFunc("/api/v1/namespaces", s.handleNamespaceList)
+
+	// Project API endpoints (OpenShift compatibility)
+	mux.HandleFunc("/apis/project.openshift.io/v1/projects/", s.handleProjectByName)
+	mux.HandleFunc("/apis/project.openshift.io/v1/projects", s.handleProjectList)
+	mux.HandleFunc("/oapi/v1/projects", s.handleProjectList) // Legacy OpenShift API
 
 	// Pod API endpoints
 	mux.HandleFunc("/api/v1/pods", s.handleClusterPods)
@@ -70,6 +79,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/version", s.handleVersion)
 
 	klog.Infof("Registered API routes:")
+	klog.Infof("  GET /api/v1/namespaces")
+	klog.Infof("  GET /apis/project.openshift.io/v1/projects")
+	klog.Infof("  GET /oapi/v1/projects")
 	klog.Infof("  GET /api/v1/pods")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}")
@@ -113,7 +125,21 @@ func (s *Server) handleAPIsDiscovery(w http.ResponseWriter, r *http.Request) {
 			Kind:       "APIGroupList",
 			APIVersion: "v1",
 		},
-		Groups: []metav1.APIGroup{}, // Empty - we only support core API for now
+		Groups: []metav1.APIGroup{
+			{
+				Name: "project.openshift.io",
+				Versions: []metav1.GroupVersionForDiscovery{
+					{
+						GroupVersion: "project.openshift.io/v1",
+						Version:      "v1",
+					},
+				},
+				PreferredVersion: metav1.GroupVersionForDiscovery{
+					GroupVersion: "project.openshift.io/v1",
+					Version:      "v1",
+				},
+			},
+		},
 	}
 
 	s.writeJSON(w, apiGroupList)
@@ -134,6 +160,14 @@ func (s *Server) handleAPIV1Discovery(w http.ResponseWriter, r *http.Request) {
 		GroupVersion: "v1",
 		APIResources: []metav1.APIResource{
 			{
+				Name:         "namespaces",
+				SingularName: "namespace",
+				Namespaced:   false,
+				Kind:         "Namespace",
+				Verbs:        []string{"get", "list"},
+				ShortNames:   []string{"ns"},
+			},
+			{
 				Name:         "pods",
 				SingularName: "pod",
 				Namespaced:   true,
@@ -145,6 +179,135 @@ func (s *Server) handleAPIV1Discovery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, apiResourceList)
+}
+
+// handleProjectAPIDiscovery returns resources available in the project.openshift.io/v1 API
+func (s *Server) handleProjectAPIDiscovery(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	apiResourceList := &metav1.APIResourceList{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "APIResourceList",
+			APIVersion: "v1",
+		},
+		GroupVersion: "project.openshift.io/v1",
+		APIResources: []metav1.APIResource{
+			{
+				Name:         "projects",
+				SingularName: "project",
+				Namespaced:   false,
+				Kind:         "Project",
+				Verbs:        []string{"get", "list"},
+			},
+		},
+	}
+
+	s.writeJSON(w, apiResourceList)
+}
+
+// handleNamespaceList handles requests to /api/v1/namespaces
+func (s *Server) handleNamespaceList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	namespaces := s.podStorage.ListNamespaces()
+
+	// Create Kubernetes-compatible namespace objects
+	var namespaceItems []corev1.Namespace
+	for _, ns := range namespaces {
+		namespaceItems = append(namespaceItems, corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Namespace",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: ns,
+			},
+		})
+	}
+
+	namespaceList := &corev1.NamespaceList{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "NamespaceList",
+			APIVersion: "v1",
+		},
+		Items: namespaceItems,
+	}
+
+	s.writeJSON(w, namespaceList)
+}
+
+// handleProjectList handles requests to /apis/project.openshift.io/v1/projects and /oapi/v1/projects
+func (s *Server) handleProjectList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	projectList := s.podStorage.ListProjects()
+	s.writeJSON(w, projectList)
+}
+
+// handleProjectByName handles requests to /apis/project.openshift.io/v1/projects/{name}
+func (s *Server) handleProjectByName(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the project name from URL
+	path := strings.TrimPrefix(r.URL.Path, "/apis/project.openshift.io/v1/projects/")
+	projectName := strings.Split(path, "/")[0]
+
+	if projectName == "" {
+		http.Error(w, "Project name is required", http.StatusBadRequest)
+		return
+	}
+
+	// Get the list of available namespaces
+	namespaces := s.podStorage.ListNamespaces()
+
+	// Check if the requested project exists
+	projectExists := false
+	for _, ns := range namespaces {
+		if ns == projectName {
+			projectExists = true
+			break
+		}
+	}
+
+	if !projectExists {
+		http.Error(w, fmt.Sprintf(`projects.project.openshift.io "%s" not found`, projectName), http.StatusNotFound)
+		return
+	}
+
+	// Return the specific project
+	project := &storage.Project{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Project",
+			APIVersion: "project.openshift.io/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: projectName,
+			Annotations: map[string]string{
+				"openshift.io/display-name": projectName,
+				"openshift.io/description":  fmt.Sprintf("Project for %s", projectName),
+			},
+		},
+		Spec: storage.ProjectSpec{
+			Finalizers: []string{"kubernetes"},
+		},
+		Status: storage.ProjectStatus{
+			Phase: "Active",
+		},
+	}
+
+	s.writeJSON(w, project)
 }
 
 // handleClusterPods handles requests to /api/v1/pods (cluster-wide pods)
