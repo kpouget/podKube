@@ -496,10 +496,18 @@ func (s *Server) deletePod(w http.ResponseWriter, r *http.Request, namespace, na
 		return
 	}
 
-	// Return success status with empty response body (standard K8s behavior)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("{}"))
+	// Return success status with proper Kubernetes Status object
+	status := &metav1.Status{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Status",
+			APIVersion: "v1",
+		},
+		Status:  "Success",
+		Code:    200,
+		Message: fmt.Sprintf(`pod "%s" deleted`, name),
+	}
+
+	s.writeJSON(w, status)
 }
 
 // handlePodLogs handles requests for pod logs: /api/v1/namespaces/{namespace}/pods/{name}/log
