@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -85,6 +86,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	klog.Infof("  GET /api/v1/pods")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}")
+	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}/log")
 	klog.Infof("  GET /healthz, /readyz, /livez")
 	klog.Infof("  GET /version")
 }
@@ -342,6 +344,13 @@ func (s *Server) handleNamespacedResources(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Handle pod logs requests: /api/v1/namespaces/{namespace}/pods/{name}/log
+	if len(parts) == 4 && parts[3] == "log" {
+		podName := parts[2]
+		s.handlePodLogs(w, r, namespace, podName)
+		return
+	}
+
 	// Handle specific pod requests
 	if len(parts) == 3 {
 		podName := parts[2]
@@ -491,6 +500,146 @@ func (s *Server) deletePod(w http.ResponseWriter, r *http.Request, namespace, na
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("{}"))
+}
+
+// handlePodLogs handles requests for pod logs: /api/v1/namespaces/{namespace}/pods/{name}/log
+func (s *Server) handlePodLogs(w http.ResponseWriter, r *http.Request, namespace, name string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Validate that the pod exists first
+	_, err := s.podStorage.Get(namespace, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, fmt.Sprintf(`pods "%s" not found`, name), http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf("Failed to get pod: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Parse query parameters for logs options
+	query := r.URL.Query()
+	follow := query.Get("follow") == "true"
+	timestamps := query.Get("timestamps") == "true"
+	previous := query.Get("previous") == "true"
+	sinceSeconds := query.Get("sinceSeconds")
+	tailLines := query.Get("tailLines")
+
+	// Build podman logs command
+	args := []string{"logs"}
+
+	if follow {
+		args = append(args, "--follow")
+	}
+	if timestamps {
+		args = append(args, "--timestamps")
+	}
+	if previous {
+		args = append(args, "--latest")
+	}
+	if sinceSeconds != "" {
+		args = append(args, "--since", sinceSeconds+"s")
+	}
+	if tailLines != "" {
+		args = append(args, "--tail", tailLines)
+	}
+
+	// Add the container name
+	args = append(args, name)
+
+	klog.Infof("Executing: podman %v", strings.Join(args, " "))
+
+	// Execute podman logs command
+	cmd := exec.Command("podman", args...)
+
+	if follow {
+		// For follow mode, we need to stream the output
+		s.streamPodmanLogs(w, r, cmd)
+	} else {
+		// For non-follow mode, get all output and return it
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			klog.Errorf("Failed to get logs for pod %s/%s: %v, output: %s", namespace, name, err, string(output))
+			http.Error(w, fmt.Sprintf("Failed to get logs: %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		klog.Infof("Got %d bytes of log output for pod %s/%s", len(output), namespace, name)
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+
+		if len(output) > 0 {
+			n, err := w.Write(output)
+			if err != nil {
+				klog.Errorf("Failed to write logs response: %v", err)
+			} else {
+				klog.Infof("Successfully wrote %d bytes to response", n)
+			}
+		} else {
+			klog.Infof("No log output for pod %s/%s", namespace, name)
+		}
+	}
+}
+
+// streamPodmanLogs handles streaming logs for follow mode
+func (s *Server) streamPodmanLogs(w http.ResponseWriter, r *http.Request, cmd *exec.Cmd) {
+	// Set headers for streaming
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	// Get stdout pipe
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create pipe: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to start logs command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Make sure we can flush the response
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Write initial response
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// Copy output to response writer
+	// Note: This will block until the command finishes or the client disconnects
+	buffer := make([]byte, 4096)
+	for {
+		n, err := stdout.Read(buffer)
+		if n > 0 {
+			w.Write(buffer[:n])
+			flusher.Flush()
+		}
+		if err != nil {
+			break
+		}
+		// Check if client disconnected
+		if r.Context().Done() != nil {
+			select {
+			case <-r.Context().Done():
+				cmd.Process.Kill()
+				return
+			default:
+			}
+		}
+	}
+
+	// Wait for command to finish
+	cmd.Wait()
 }
 
 // handleHealth handles health check requests
