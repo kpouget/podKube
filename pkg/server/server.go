@@ -24,10 +24,10 @@ import (
 
 // Server represents our Kubernetes API server
 type Server struct {
-	host        string
-	port        int
-	httpServer  *http.Server
-	podStorage  *storage.PodStorage
+	host       string
+	port       int
+	httpServer *http.Server
+	podStorage *storage.PodStorage
 }
 
 // New creates a new Kubernetes API server

@@ -10,10 +10,10 @@ import (
 
 func main() {
 	var (
-		port = flag.Int("port", 8443, "Port to serve on")
-		host = flag.String("host", "0.0.0.0", "Host to serve on")
+		port     = flag.Int("port", 8443, "Port to serve on")
+		host     = flag.String("host", "0.0.0.0", "Host to serve on")
 		certFile = flag.String("cert-file", "", "Path to TLS certificate file")
-		keyFile = flag.String("key-file", "", "Path to TLS private key file")
+		keyFile  = flag.String("key-file", "", "Path to TLS private key file")
 	)
 
 	klog.InitFlags(nil)
