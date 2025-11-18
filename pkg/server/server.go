@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -90,6 +91,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}/log")
+	klog.Infof("  POST /api/v1/namespaces/{namespace}/pods/{name}/exec")
 	klog.Infof("  GET /api/v1/secrets")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/secrets")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/secrets/{name}")
@@ -182,6 +184,20 @@ func (s *Server) handleAPIV1Discovery(w http.ResponseWriter, r *http.Request) {
 				Kind:         "Pod",
 				Verbs:        []string{"get", "list", "create", "update", "patch", "delete", "deletecollection", "watch"},
 				Categories:   []string{"all"},
+			},
+			{
+				Name:         "pods/exec",
+				SingularName: "",
+				Namespaced:   true,
+				Kind:         "PodExecOptions",
+				Verbs:        []string{"create"},
+			},
+			{
+				Name:         "pods/log",
+				SingularName: "",
+				Namespaced:   true,
+				Kind:         "PodLogOptions",
+				Verbs:        []string{"get"},
 			},
 			{
 				Name:         "secrets",
@@ -369,6 +385,13 @@ func (s *Server) handleNamespacedResources(w http.ResponseWriter, r *http.Reques
 		if len(parts) == 4 && parts[3] == "log" {
 			podName := parts[2]
 			s.handlePodLogs(w, r, namespace, podName)
+			return
+		}
+
+		// Handle pod exec requests: /api/v1/namespaces/{namespace}/pods/{name}/exec
+		if len(parts) == 4 && parts[3] == "exec" {
+			podName := parts[2]
+			s.handlePodExec(w, r, namespace, podName)
 			return
 		}
 
@@ -907,6 +930,176 @@ func (s *Server) streamPodmanLogs(w http.ResponseWriter, r *http.Request, cmd *e
 			default:
 			}
 		}
+	}
+
+	// Wait for command to finish
+	cmd.Wait()
+}
+
+// handlePodExec handles requests for pod exec: /api/v1/namespaces/{namespace}/pods/{name}/exec
+func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, namespace, name string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Validate that the pod exists first
+	_, err := s.podStorage.Get(namespace, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, fmt.Sprintf(`pods "%s" not found`, name), http.StatusNotFound)
+		} else {
+			http.Error(w, fmt.Sprintf("Failed to get pod: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Parse query parameters for exec options
+	query := r.URL.Query()
+	command := query["command"] // Array of command parts
+	stdin := query.Get("stdin") == "true"
+	stdout := query.Get("stdout") == "true"
+	stderr := query.Get("stderr") == "true"
+	tty := query.Get("tty") == "true"
+
+	// Default to stdout if nothing specified
+	if !stdin && !stdout && !stderr {
+		stdout = true
+	}
+
+	// Validate command
+	if len(command) == 0 {
+		http.Error(w, "No command specified", http.StatusBadRequest)
+		return
+	}
+
+	klog.Infof("Executing command in pod %s/%s: %v", namespace, name, command)
+
+	// Build podman exec command
+	args := []string{"exec"}
+	if tty {
+		args = append(args, "-t")
+	}
+	if stdin {
+		args = append(args, "-i")
+	}
+
+	// Add the container name and command
+	args = append(args, name)
+	args = append(args, command...)
+
+	klog.Infof("Executing: podman %v", strings.Join(args, " "))
+
+	// Handle different streaming modes
+	if stdin && (stdout || stderr) {
+		// Interactive mode - bidirectional streaming
+		s.handleInteractiveExec(w, r, args, tty)
+	} else {
+		// Simple exec mode - just run command and return output
+		s.handleSimpleExec(w, r, args)
+	}
+}
+
+// handleSimpleExec executes a command and returns the output
+func (s *Server) handleSimpleExec(w http.ResponseWriter, r *http.Request, args []string) {
+	cmd := exec.Command("podman", args...)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		klog.Errorf("Failed to exec command: %v, output: %s", err, string(output))
+		http.Error(w, fmt.Sprintf("Failed to exec: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(output)
+}
+
+// handleInteractiveExec handles interactive exec with bidirectional streaming
+func (s *Server) handleInteractiveExec(w http.ResponseWriter, r *http.Request, args []string, tty bool) {
+	// Set headers for streaming
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Transfer-Encoding", "chunked")
+
+	// Check if we can flush the response
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Create the command
+	cmd := exec.Command("podman", args...)
+
+	// Set up pipes
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create stdin pipe: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer stdin.Close()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create stdout pipe: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create stderr pipe: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to start command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Write initial response
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// Handle stdout in a goroutine
+	go func() {
+		defer stdout.Close()
+		buffer := make([]byte, 1024)
+		for {
+			n, err := stdout.Read(buffer)
+			if n > 0 {
+				w.Write(buffer[:n])
+				flusher.Flush()
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// Handle stderr in a goroutine
+	go func() {
+		defer stderr.Close()
+		buffer := make([]byte, 1024)
+		for {
+			n, err := stderr.Read(buffer)
+			if n > 0 {
+				w.Write(buffer[:n])
+				flusher.Flush()
+			}
+			if err != nil {
+				break
+			}
+		}
+	}()
+
+	// Handle stdin from request body
+	if r.Body != nil {
+		go func() {
+			defer stdin.Close()
+			io.Copy(stdin, r.Body)
+		}()
 	}
 
 	// Wait for command to finish
