@@ -18,7 +18,11 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/httpstream"
+	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
+	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
 	"k8s.io/klog/v2"
 
 	"podman-k8s-adapter/pkg/storage"
@@ -990,7 +994,22 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, namespace
 
 	klog.Infof("Executing: podman %v", strings.Join(args, " "))
 
-	// Handle different streaming modes
+	// Check if this is an upgrade request (WebSocket or SPDY)
+	klog.Infof("Checking for protocol upgrade. Connection: %s, Upgrade: %s", r.Header.Get("Connection"), r.Header.Get("Upgrade"))
+	if isUpgradeRequest(r) {
+		upgrade := strings.ToLower(r.Header.Get("Upgrade"))
+		if strings.HasPrefix(upgrade, "spdy") {
+			klog.Infof("Handling SPDY exec request")
+			s.handleSPDYExec(w, r, args, stdin, stdout, stderr, tty)
+		} else if upgrade == "websocket" {
+			klog.Infof("Handling WebSocket exec request")
+			s.handleWebSocketExec(w, r, args, stdin, stdout, stderr, tty)
+		}
+		return
+	}
+	klog.Infof("Using HTTP streaming exec mode")
+
+	// Handle different streaming modes for HTTP
 	if stdin && (stdout || stderr) {
 		// Interactive mode - bidirectional streaming
 		s.handleInteractiveExec(w, r, args, tty)
@@ -1104,6 +1123,287 @@ func (s *Server) handleInteractiveExec(w http.ResponseWriter, r *http.Request, a
 
 	// Wait for command to finish
 	cmd.Wait()
+}
+
+// isUpgradeRequest checks if the request is asking for a protocol upgrade
+func isUpgradeRequest(r *http.Request) bool {
+	connectionHeaders := r.Header["Connection"]
+	for _, header := range connectionHeaders {
+		if strings.Contains(strings.ToLower(header), "upgrade") {
+			return true
+		}
+	}
+	return false
+}
+
+// ExecOptions contains details about which streams are required for remote command execution
+type ExecOptions struct {
+	Stdin  bool
+	Stdout bool
+	Stderr bool
+	TTY    bool
+}
+
+// connectionContext contains the connection and streams used when forwarding an exec session
+type connectionContext struct {
+	conn         io.Closer
+	stdinStream  io.ReadCloser
+	stdoutStream io.WriteCloser
+	stderrStream io.WriteCloser
+	writeStatus  func(status *apierrors.StatusError) error
+	tty          bool
+}
+
+// streamAndReply holds both a Stream and a channel that is closed when the stream's reply frame is enqueued
+type streamAndReply struct {
+	httpstream.Stream
+	replySent <-chan struct{}
+}
+
+// handleSPDYExec handles SPDY-based exec requests following kubelet patterns
+func (s *Server) handleSPDYExec(w http.ResponseWriter, r *http.Request, args []string, stdin, stdout, stderr, tty bool) {
+	klog.Infof("Kubelet-style SPDY exec session starting")
+
+	// Parse options from request parameters (kubelet style)
+	opts := &ExecOptions{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+		TTY:    tty,
+	}
+
+	// Supported stream protocols (latest to oldest)
+	supportedStreamProtocols := []string{
+		remotecommandconsts.StreamProtocolV4Name,
+		remotecommandconsts.StreamProtocolV3Name,
+		remotecommandconsts.StreamProtocolV2Name,
+		remotecommandconsts.StreamProtocolV1Name,
+	}
+
+	// Create streaming context using kubelet patterns
+	ctx, ok := s.createStreams(r, w, opts, supportedStreamProtocols, 30*time.Second, 10*time.Second)
+	if !ok {
+		// error is handled by createStreams
+		return
+	}
+	defer ctx.conn.Close()
+
+	// Execute the command with established streams
+	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, ctx.tty)
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
+			rc := exitErr.ProcessState.ExitCode()
+			ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{
+				Status: metav1.StatusFailure,
+				Reason: remotecommandconsts.NonZeroExitCodeReason,
+				Details: &metav1.StatusDetails{
+					Causes: []metav1.StatusCause{
+						{
+							Type:    remotecommandconsts.ExitCodeCauseType,
+							Message: fmt.Sprintf("%d", rc),
+						},
+					},
+				},
+				Message: fmt.Sprintf("command terminated with non-zero exit code: %v", exitErr),
+			}})
+		} else {
+			err = fmt.Errorf("error executing command in container: %v", err)
+			klog.Errorf("%v", err)
+			ctx.writeStatus(apierrors.NewInternalError(err))
+		}
+	} else {
+		ctx.writeStatus(&apierrors.StatusError{ErrStatus: metav1.Status{
+			Status: metav1.StatusSuccess,
+		}})
+	}
+
+	klog.Infof("Kubelet-style SPDY exec session completed")
+}
+
+// createStreams creates the SPDY connection and waits for client streams (kubelet pattern)
+func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *ExecOptions, supportedStreamProtocols []string, idleTimeout, streamCreationTimeout time.Duration) (*connectionContext, bool) {
+	// Perform protocol handshake
+	protocol, err := httpstream.Handshake(req, w, supportedStreamProtocols)
+	if err != nil {
+		klog.Errorf("Failed to perform protocol handshake: %v", err)
+		return nil, false
+	}
+
+	klog.Infof("Negotiated protocol: %s", protocol)
+
+	streamCh := make(chan streamAndReply)
+
+	upgrader := spdy.NewResponseUpgrader()
+	conn := upgrader.UpgradeResponse(w, req, func(stream httpstream.Stream, replySent <-chan struct{}) error {
+		streamCh <- streamAndReply{Stream: stream, replySent: replySent}
+		return nil
+	})
+
+	if conn == nil {
+		klog.Errorf("Failed to upgrade connection to SPDY")
+		return nil, false
+	}
+
+	conn.SetIdleTimeout(idleTimeout)
+
+	// Count expected streams (error stream + requested streams)
+	expectedStreams := 1 // error stream is always expected
+	if opts.Stdin {
+		expectedStreams++
+	}
+	if opts.Stdout {
+		expectedStreams++
+	}
+	if opts.Stderr {
+		expectedStreams++
+	}
+
+	klog.Infof("Waiting for %d streams from client", expectedStreams)
+
+	// Wait for client to create all expected streams
+	ctx, err := s.waitForStreams(streamCh, expectedStreams, streamCreationTimeout, protocol)
+	if err != nil {
+		klog.Errorf("Failed to wait for streams: %v", err)
+		conn.Close()
+		return nil, false
+	}
+
+	ctx.conn = conn
+	return ctx, true
+}
+
+// waitForStreams waits for the client to create the expected number of streams
+func (s *Server) waitForStreams(streams <-chan streamAndReply, expectedStreams int, timeout time.Duration, protocol string) (*connectionContext, error) {
+	ctx := &connectionContext{}
+	receivedStreams := 0
+	replyChan := make(chan struct{})
+	expired := time.NewTimer(timeout)
+	defer expired.Stop()
+
+	for {
+		select {
+		case stream := <-streams:
+			streamType := stream.Headers().Get(corev1.StreamType)
+			klog.Infof("Received stream type: %s", streamType)
+
+			switch streamType {
+			case corev1.StreamTypeError:
+				ctx.writeStatus = s.createWriteStatusFunc(stream, protocol)
+				go s.waitStreamReply(stream.replySent, replyChan)
+			case corev1.StreamTypeStdin:
+				ctx.stdinStream = stream
+				go s.waitStreamReply(stream.replySent, replyChan)
+			case corev1.StreamTypeStdout:
+				ctx.stdoutStream = stream
+				go s.waitStreamReply(stream.replySent, replyChan)
+			case corev1.StreamTypeStderr:
+				ctx.stderrStream = stream
+				go s.waitStreamReply(stream.replySent, replyChan)
+			default:
+				klog.Errorf("Unexpected stream type: %q", streamType)
+			}
+
+		case <-replyChan:
+			receivedStreams++
+			klog.Infof("Received stream reply %d/%d", receivedStreams, expectedStreams)
+			if receivedStreams == expectedStreams {
+				klog.Infof("All expected streams received")
+				return ctx, nil
+			}
+
+		case <-expired.C:
+			return nil, fmt.Errorf("timed out waiting for client to create streams")
+		}
+	}
+}
+
+// waitStreamReply waits for a stream reply and signals completion
+func (s *Server) waitStreamReply(replySent <-chan struct{}, notify chan<- struct{}) {
+	<-replySent
+	notify <- struct{}{}
+}
+
+// createWriteStatusFunc creates a status writing function based on protocol version
+func (s *Server) createWriteStatusFunc(stream httpstream.Stream, protocol string) func(status *apierrors.StatusError) error {
+	return func(status *apierrors.StatusError) error {
+		defer stream.Close()
+
+		if status.Status().Status == metav1.StatusSuccess {
+			klog.Infof("Writing success status")
+		} else {
+			klog.Infof("Writing error status: %s", status.Error())
+		}
+
+		// For v4+ protocols, write JSON status
+		if protocol == remotecommandconsts.StreamProtocolV4Name {
+			return s.writeV4Status(stream, status)
+		} else {
+			// For older protocols, write simple status
+			return s.writeV1Status(stream, status)
+		}
+	}
+}
+
+// writeV4Status writes status in v4 protocol format (JSON)
+func (s *Server) writeV4Status(stream httpstream.Stream, status *apierrors.StatusError) error {
+	statusBytes, err := json.Marshal(status.Status())
+	if err != nil {
+		return err
+	}
+	_, err = stream.Write(statusBytes)
+	return err
+}
+
+// writeV1Status writes status in v1 protocol format (exit code)
+func (s *Server) writeV1Status(stream httpstream.Stream, status *apierrors.StatusError) error {
+	if status.Status().Status != metav1.StatusSuccess {
+		_, err := stream.Write([]byte(status.Error()))
+		return err
+	}
+	return nil
+}
+
+// execInContainer executes the command using the established streams
+func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, stderr io.WriteCloser, tty bool) error {
+	klog.Infof("Executing command with streams: %v", args)
+
+	cmd := exec.Command("podman", args...)
+
+	// Set up pipes
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+	if stdout != nil {
+		cmd.Stdout = stdout
+	}
+	if stderr != nil && !tty {
+		cmd.Stderr = stderr
+	}
+
+	// Start and wait for the command
+	err := cmd.Run()
+
+	klog.Infof("Command completed with error: %v", err)
+	return err
+}
+
+
+// handleWebSocketExec handles WebSocket-based exec requests (placeholder for now)
+func (s *Server) handleWebSocketExec(w http.ResponseWriter, r *http.Request, args []string, stdin, stdout, stderr, tty bool) {
+	klog.Infof("WebSocket exec not fully implemented yet, falling back to simple exec")
+
+	// For now, fall back to simple exec
+	cmd := exec.Command("podman", args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		klog.Errorf("Failed to exec command: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to exec: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(output)
 }
 
 // handleSecretByName handles requests for specific secrets
