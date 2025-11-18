@@ -25,7 +25,7 @@ run: build
 .PHONY: run-bg
 run-bg: build
 	@echo "Starting Podman Kubernetes API Server in background on $(HOST):$(PORT)..."
-	./$(BINARY_NAME) --port $(PORT) --host $(HOST) &
+	./$(BINARY_NAME) --port $(PORT) --host $(HOST) > /tmp/podman-adapter 2>&1 &
 	@echo "Server started. Use 'make stop' to stop it."
 
 # Stop background server
