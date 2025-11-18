@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -917,7 +919,9 @@ func (s *Server) streamPodmanLogs(w http.ResponseWriter, r *http.Request, cmd *e
 	// Note: This will block until the command finishes or the client disconnects
 	buffer := make([]byte, 4096)
 	for {
+		klog.Infof("=== EXEC DEBUG: Reading Stdout ...")
 		n, err := stdout.Read(buffer)
+		klog.Infof("=== EXEC DEBUG: Reading Stdout ...")
 		if n > 0 {
 			w.Write(buffer[:n])
 			flusher.Flush()
@@ -965,6 +969,24 @@ func (s *Server) handlePodExec(w http.ResponseWriter, r *http.Request, namespace
 	stdout := query.Get("stdout") == "true"
 	stderr := query.Get("stderr") == "true"
 	tty := query.Get("tty") == "true"
+
+	// Debug logging for request details
+	klog.Infof("Full URL: %s", r.URL.String())
+	klog.Infof("Raw Query: %s", r.URL.RawQuery)
+	klog.Infof("Query params: stdin=%s(%t), stdout=%s(%t), stderr=%s(%t), tty=%s(%t)",
+		query.Get("stdin"), stdin,
+		query.Get("stdout"), stdout,
+		query.Get("stderr"), stderr,
+		query.Get("tty"), tty)
+
+	// Check if TTY info might be in headers
+	klog.Infof("Request headers: %+v", r.Header)
+
+	// Check if TTY info is inferred from stream setup - in kubelet, TTY might be detected
+	// by whether stderr is disabled when stdin+stdout are present
+	inferredTTY := stdin && stdout && !stderr
+	klog.Infof("Inferred TTY from streams: %t (stdin=%t && stdout=%t && !stderr=%t)",
+		inferredTTY, stdin, stdout, stderr)
 
 	// Default to stdout if nothing specified
 	if !stdin && !stdout && !stderr {
@@ -1086,7 +1108,9 @@ func (s *Server) handleInteractiveExec(w http.ResponseWriter, r *http.Request, a
 		defer stdout.Close()
 		buffer := make([]byte, 1024)
 		for {
+			klog.Infof("=== EXEC DEBUG: Reading Stdout(2) ...")
 			n, err := stdout.Read(buffer)
+			klog.Infof("=== EXEC DEBUG: Reading Stdout(2) ... DONE")
 			if n > 0 {
 				w.Write(buffer[:n])
 				flusher.Flush()
@@ -1102,7 +1126,9 @@ func (s *Server) handleInteractiveExec(w http.ResponseWriter, r *http.Request, a
 		defer stderr.Close()
 		buffer := make([]byte, 1024)
 		for {
+			klog.Infof("=== EXEC DEBUG: Reading Stderr ...")
 			n, err := stderr.Read(buffer)
+			klog.Infof("=== EXEC DEBUG: Reading Stderr ... DONE")
 			if n > 0 {
 				w.Write(buffer[:n])
 				flusher.Flush()
@@ -1162,7 +1188,7 @@ type streamAndReply struct {
 
 // handleSPDYExec handles SPDY-based exec requests following kubelet patterns
 func (s *Server) handleSPDYExec(w http.ResponseWriter, r *http.Request, args []string, stdin, stdout, stderr, tty bool) {
-	klog.Infof("Kubelet-style SPDY exec session starting")
+	klog.Infof("Kubelet-style SPDY exec session starting tty=%v", tty)
 
 	// Parse options from request parameters (kubelet style)
 	opts := &ExecOptions{
@@ -1189,7 +1215,7 @@ func (s *Server) handleSPDYExec(w http.ResponseWriter, r *http.Request, args []s
 	defer ctx.conn.Close()
 
 	// Execute the command with established streams
-	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, ctx.tty)
+	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, tty)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
 			rc := exitErr.ProcessState.ExitCode()
@@ -1363,28 +1389,171 @@ func (s *Server) writeV1Status(stream httpstream.Stream, status *apierrors.Statu
 	return nil
 }
 
-// execInContainer executes the command using the established streams
+// execInContainer executes the command using the established streams (kubelet-style async stream handling)
 func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, stderr io.WriteCloser, tty bool) error {
-	klog.Infof("Executing command with streams: %v", args)
+	klog.Infof("=== EXEC DEBUG: Starting execInContainer with args: %v", args)
+	klog.Infof("=== EXEC DEBUG: Stream setup - stdin: %t, stdout: %t, stderr: %t, tty: %t",
+		stdin != nil, stdout != nil, stderr != nil, tty)
+
+	// Create context to cancel goroutines when command completes
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	cmd := exec.Command("podman", args...)
 
-	// Set up pipes
+	// Set up pipes for all streams
+	var stdinPipe io.WriteCloser
+	var stdoutPipe io.ReadCloser
+	var stderrPipe io.ReadCloser
+	var err error
+
 	if stdin != nil {
-		cmd.Stdin = stdin
+		klog.Infof("=== EXEC DEBUG: Creating stdin pipe")
+		stdinPipe, err = cmd.StdinPipe()
+		if err != nil {
+			klog.Errorf("=== EXEC DEBUG: Failed to create stdin pipe: %v", err)
+			return fmt.Errorf("failed to create stdin pipe: %v", err)
+		}
+		klog.Infof("=== EXEC DEBUG: Stdin pipe created successfully")
 	}
+
 	if stdout != nil {
-		cmd.Stdout = stdout
+		klog.Infof("=== EXEC DEBUG: Creating stdout pipe")
+		stdoutPipe, err = cmd.StdoutPipe()
+		if err != nil {
+			klog.Errorf("=== EXEC DEBUG: Failed to create stdout pipe: %v", err)
+			return fmt.Errorf("failed to create stdout pipe: %v", err)
+		}
+		klog.Infof("=== EXEC DEBUG: Stdout pipe created successfully")
 	}
+
 	if stderr != nil && !tty {
-		cmd.Stderr = stderr
+		klog.Infof("=== EXEC DEBUG: Creating stderr pipe")
+		stderrPipe, err = cmd.StderrPipe()
+		if err != nil {
+			klog.Errorf("=== EXEC DEBUG: Failed to create stderr pipe: %v", err)
+			return fmt.Errorf("failed to create stderr pipe: %v", err)
+		}
+		klog.Infof("=== EXEC DEBUG: Stderr pipe created successfully")
 	}
 
-	// Start and wait for the command
-	err := cmd.Run()
+	// Start the command
+	klog.Infof("=== EXEC DEBUG: Starting podman command")
+	err = cmd.Start()
+	if err != nil {
+		klog.Errorf("=== EXEC DEBUG: Failed to start command: %v", err)
+		return err
+	}
+	klog.Infof("=== EXEC DEBUG: Podman command started successfully, PID: %d", cmd.Process.Pid)
 
-	klog.Infof("Command completed with error: %v", err)
-	return err
+	// Handle streams asynchronously (kubelet pattern)
+	var wg sync.WaitGroup
+	streamCount := 0
+
+	// Handle stdin -> command.stdin
+	if stdinPipe != nil && stdin != nil {
+		streamCount++
+		wg.Add(1)
+		klog.Infof("=== EXEC DEBUG: Starting stdin goroutine (%d)", streamCount)
+		go func() {
+			defer wg.Done()
+			defer stdinPipe.Close()
+			klog.Infof("=== EXEC DEBUG: Stdin goroutine: Starting with context cancellation")
+
+			// Use io.Copy but with context cancellation
+			done := make(chan struct{})
+			go func() {
+				bytes, err := io.Copy(stdinPipe, stdin)
+				klog.Infof("=== EXEC DEBUG: Stdin io.Copy completed: %d bytes, error: %v", bytes, err)
+				close(done)
+			}()
+
+			// Wait for either copy completion or context cancellation
+			select {
+			case <-done:
+				klog.Infof("=== EXEC DEBUG: Stdin goroutine: Copy completed normally")
+			case <-ctx.Done():
+				klog.Infof("=== EXEC DEBUG: Stdin goroutine: Cancelled by context")
+			}
+			klog.Infof("=== EXEC DEBUG: Stdin goroutine: Exiting")
+		}()
+	}
+
+	// Handle command.stdout -> client stdout
+	if stdoutPipe != nil && stdout != nil {
+		streamCount++
+		wg.Add(1)
+		klog.Infof("=== EXEC DEBUG: Starting stdout goroutine (%d)", streamCount)
+		go func() {
+			defer wg.Done()
+			defer stdoutPipe.Close()
+			klog.Infof("=== EXEC DEBUG: Stdout goroutine: Starting with context cancellation")
+
+			// Use io.Copy but with context cancellation
+			done := make(chan struct{})
+			go func() {
+				bytes, err := io.Copy(stdout, stdoutPipe)
+				klog.Infof("=== EXEC DEBUG: Stdout io.Copy completed: %d bytes, error: %v", bytes, err)
+				close(done)
+			}()
+
+			// Wait for either copy completion or context cancellation
+			select {
+			case <-done:
+				klog.Infof("=== EXEC DEBUG: Stdout goroutine: Copy completed normally")
+			case <-ctx.Done():
+				klog.Infof("=== EXEC DEBUG: Stdout goroutine: Cancelled by context")
+			}
+			klog.Infof("=== EXEC DEBUG: Stdout goroutine: Exiting")
+		}()
+	}
+
+	// Handle command.stderr -> client stderr (only if not TTY)
+	if stderrPipe != nil && stderr != nil {
+		streamCount++
+		wg.Add(1)
+		klog.Infof("=== EXEC DEBUG: Starting stderr goroutine (%d)", streamCount)
+		go func() {
+			defer wg.Done()
+			defer stderrPipe.Close()
+			klog.Infof("=== EXEC DEBUG: Stderr goroutine: Starting with context cancellation")
+
+			// Use io.Copy but with context cancellation
+			done := make(chan struct{})
+			go func() {
+				bytes, err := io.Copy(stderr, stderrPipe)
+				klog.Infof("=== EXEC DEBUG: Stderr io.Copy completed: %d bytes, error: %v", bytes, err)
+				close(done)
+			}()
+
+			// Wait for either copy completion or context cancellation
+			select {
+			case <-done:
+				klog.Infof("=== EXEC DEBUG: Stderr goroutine: Copy completed normally")
+			case <-ctx.Done():
+				klog.Infof("=== EXEC DEBUG: Stderr goroutine: Cancelled by context")
+			}
+			klog.Infof("=== EXEC DEBUG: Stderr goroutine: Exiting")
+		}()
+	}
+
+	klog.Infof("=== EXEC DEBUG: Started %d stream goroutines, waiting for command to complete", streamCount)
+
+	// Wait for the command to complete
+	klog.Infof("=== EXEC DEBUG: Calling cmd.Wait()")
+	cmdErr := cmd.Wait()
+	klog.Infof("=== EXEC DEBUG: cmd.Wait() returned with error: %v", cmdErr)
+
+	// Cancel context to force all goroutines to exit
+	klog.Infof("=== EXEC DEBUG: Cancelling context to force goroutines to exit")
+	cancel()
+
+	// Wait for all stream copying to complete (should be fast now with cancellation)
+	klog.Infof("=== EXEC DEBUG: Waiting for %d stream goroutines to complete", streamCount)
+	wg.Wait()
+	klog.Infof("=== EXEC DEBUG: All stream copying completed, returning: %v", cmdErr)
+
+	return cmdErr
 }
 
 

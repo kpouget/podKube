@@ -6,7 +6,12 @@
       "Bash(make build:*)",
       "Bash(make stop:*)",
       "Bash(pkill:*)",
-      "Bash(oc exec:*)"
+      "Bash(oc exec:*)",
+      "Bash(GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache make:*)",
+      "Bash(find:*)",
+      "Bash(GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache go build:*)",
+      "Bash(GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache go mod tidy:*)",
+      "Bash(make status:*)"
     ],
     "deny": [],
     "ask": []

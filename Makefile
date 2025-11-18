@@ -4,6 +4,7 @@ BINARY_NAME=server
 BUILD_DIR=./cmd/server
 PORT=8443
 HOST=127.0.0.1
+PID_FILE=/tmp/podman-adapter.pid
 
 # Default target
 .PHONY: all
@@ -25,14 +26,36 @@ run: build
 .PHONY: run-bg
 run-bg: build
 	@echo "Starting Podman Kubernetes API Server in background on $(HOST):$(PORT)..."
-	./$(BINARY_NAME) --port $(PORT) --host $(HOST) > /tmp/podman-adapter 2>&1 &
-	@echo "Server started. Use 'make stop' to stop it."
+	./$(BINARY_NAME) --port $(PORT) --host $(HOST) > /tmp/podman-adapter 2>&1 & echo $$! > $(PID_FILE)
+	@echo "Server started with PID $$(cat $(PID_FILE)). Use 'make stop' to stop it."
 
 # Stop background server
 .PHONY: stop
 stop:
 	@echo "Stopping server..."
-	pkill -f "./$(BINARY_NAME)" || echo "No server process found"
+	@if [ -f $(PID_FILE) ]; then \
+		PID=$$(cat $(PID_FILE)); \
+		echo "Killing process with PID $$PID"; \
+		kill $$PID && echo "Server stopped" || echo "Failed to stop server (PID $$PID may not exist)"; \
+		rm -f $(PID_FILE); \
+	else \
+		echo "No PID file found ($(PID_FILE)). Server may not be running."; \
+	fi
+
+# Check server status
+.PHONY: status
+status:
+	@if [ -f $(PID_FILE) ]; then \
+		PID=$$(cat $(PID_FILE)); \
+		if ps -p $$PID > /dev/null 2>&1; then \
+			echo "Server is running with PID $$PID"; \
+		else \
+			echo "PID file exists but process $$PID is not running"; \
+			rm -f $(PID_FILE); \
+		fi \
+	else \
+		echo "Server is not running (no PID file found)"; \
+	fi
 
 # Test the server endpoints
 .PHONY: test
@@ -59,6 +82,7 @@ test-oc:
 clean:
 	@echo "Cleaning up..."
 	rm -f $(BINARY_NAME)
+	rm -f $(PID_FILE)
 
 # Format code
 .PHONY: fmt
@@ -87,6 +111,7 @@ help:
 	@echo "  run       - Build and run the server"
 	@echo "  run-bg    - Build and run the server in background"
 	@echo "  stop      - Stop background server"
+	@echo "  status    - Check if background server is running"
 	@echo "  test      - Test server endpoints with curl"
 	@echo "  test-oc   - Test server with oc CLI"
 	@echo "  clean     - Remove build artifacts"
@@ -99,6 +124,7 @@ help:
 	@echo "  PORT=$(PORT)"
 	@echo "  HOST=$(HOST)"
 	@echo "  BINARY_NAME=$(BINARY_NAME)"
+	@echo "  PID_FILE=$(PID_FILE)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build"
