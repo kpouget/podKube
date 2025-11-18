@@ -419,6 +419,8 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 			{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted"},
 			{Name: "Age", Type: "string", Description: "CreationTimestamp is a timestamp representing the server time when this object was created"},
 			{Name: "Image", Type: "string", Description: "The image the container is running", Priority: 1},
+			{Name: "Command", Type: "string", Description: "The command the container is running", Priority: 1},
+			{Name: "Ports", Type: "string", Description: "The ports exposed by the container", Priority: 1},
 			{Name: "Container-ID", Type: "string", Description: "Container ID", Priority: 1},
 		},
 	}
@@ -434,9 +436,39 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 		// Get container info
 		image := "<none>"
 		containerID := "<none>"
+		command := "<none>"
+		ports := "<none>"
 		readyContainers := 0
 		totalContainers := len(pod.Status.ContainerStatuses)
 		restarts := int32(0)
+
+		// Get command and ports from pod spec
+		if len(pod.Spec.Containers) > 0 {
+			container := pod.Spec.Containers[0]
+
+			// Extract command
+			if len(container.Command) > 0 {
+				command = strings.Join(container.Command, " ")
+			} else if len(container.Args) > 0 {
+				command = strings.Join(container.Args, " ")
+			}
+
+			// Extract ports
+			var portStrs []string
+			for _, port := range container.Ports {
+				portStr := fmt.Sprintf("%d", port.ContainerPort)
+				if port.Protocol != "" && port.Protocol != "TCP" {
+					portStr += "/" + string(port.Protocol)
+				}
+				if port.Name != "" {
+					portStr += " (" + port.Name + ")"
+				}
+				portStrs = append(portStrs, portStr)
+			}
+			if len(portStrs) > 0 {
+				ports = strings.Join(portStrs, ", ")
+			}
+		}
 
 		if len(pod.Status.ContainerStatuses) > 0 {
 			containerStatus := pod.Status.ContainerStatuses[0]
@@ -473,6 +505,8 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 				restarts,
 				age,
 				image,
+				command,
+				ports,
 				containerID,
 			},
 		}
