@@ -416,8 +416,9 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 			{Name: "Name", Type: "string", Format: "name", Description: "Name must be unique within a namespace"},
 			{Name: "Ready", Type: "string", Description: "The aggregate readiness state of this pod for accepting traffic"},
 			{Name: "Status", Type: "string", Description: "The aggregate status of the containers in this pod"},
-			{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted"},
-			{Name: "Age", Type: "string", Description: "CreationTimestamp is a timestamp representing the server time when this object was created"},
+			{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted", Priority: 1},
+			{Name: "Age", Type: "string", Description: "Time since the container started running"},
+			{Name: "Created", Type: "string", Description: "When the container was created"},
 			{Name: "Image", Type: "string", Description: "The image the container is running", Priority: 1},
 			{Name: "Command", Type: "string", Description: "The command the container is running", Priority: 1},
 			{Name: "Ports", Type: "string", Description: "The ports exposed by the container", Priority: 1},
@@ -427,10 +428,16 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 
 	// Convert each pod to a table row
 	for _, pod := range podList.Items {
-		// Calculate age
+		// Calculate age based on start time (when container actually started running)
 		age := "<unknown>"
+		if pod.Status.StartTime != nil && !pod.Status.StartTime.IsZero() {
+			age = translateTimestampSince(*pod.Status.StartTime)
+		}
+
+		// Calculate created timestamp (relative time)
+		created := "<unknown>"
 		if !pod.CreationTimestamp.IsZero() {
-			age = translateTimestampSince(pod.CreationTimestamp)
+			created = translateTimestampSinceCreated(pod.CreationTimestamp)
 		}
 
 		// Get container info
@@ -451,6 +458,11 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 				command = strings.Join(container.Command, " ")
 			} else if len(container.Args) > 0 {
 				command = strings.Join(container.Args, " ")
+			}
+
+			// Truncate command to 32 chars + "..." if necessary
+			if len(command) > 32 {
+				command = command[:32] + "..."
 			}
 
 			// Extract ports
@@ -504,6 +516,7 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 				string(pod.Status.Phase),
 				restarts,
 				age,
+				created,
 				image,
 				command,
 				ports,
@@ -516,7 +529,7 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 	return table
 }
 
-// translateTimestampSince returns the elapsed time since timestamp in human-readable approximation
+// translateTimestampSince returns the elapsed time since timestamp in podman ps format
 func translateTimestampSince(timestamp metav1.Time) string {
 	if timestamp.IsZero() {
 		return "<unknown>"
@@ -524,15 +537,67 @@ func translateTimestampSince(timestamp metav1.Time) string {
 
 	elapsed := time.Since(timestamp.Time)
 
-	// Convert to common time units
+	// Convert to podman ps format like "Up 4 days"
 	if elapsed < time.Minute {
-		return fmt.Sprintf("%ds", int(elapsed.Seconds()))
+		seconds := int(elapsed.Seconds())
+		if seconds == 1 {
+			return "Up 1 second"
+		}
+		return fmt.Sprintf("Up %d seconds", seconds)
 	} else if elapsed < time.Hour {
-		return fmt.Sprintf("%dm", int(elapsed.Minutes()))
+		minutes := int(elapsed.Minutes())
+		if minutes == 1 {
+			return "Up 1 minute"
+		}
+		return fmt.Sprintf("Up %d minutes", minutes)
 	} else if elapsed < 24*time.Hour {
-		return fmt.Sprintf("%dh", int(elapsed.Hours()))
+		hours := int(elapsed.Hours())
+		if hours == 1 {
+			return "Up 1 hour"
+		}
+		return fmt.Sprintf("Up %d hours", hours)
 	} else {
-		return fmt.Sprintf("%dd", int(elapsed.Hours()/24))
+		days := int(elapsed.Hours() / 24)
+		if days == 1 {
+			return "Up 1 day"
+		}
+		return fmt.Sprintf("Up %d days", days)
+	}
+}
+
+// translateTimestampSinceCreated returns the elapsed time since timestamp in "X ago" format
+func translateTimestampSinceCreated(timestamp metav1.Time) string {
+	if timestamp.IsZero() {
+		return "<unknown>"
+	}
+
+	elapsed := time.Since(timestamp.Time)
+
+	// Convert to "X ago" format
+	if elapsed < time.Minute {
+		seconds := int(elapsed.Seconds())
+		if seconds == 1 {
+			return "1 second ago"
+		}
+		return fmt.Sprintf("%d seconds ago", seconds)
+	} else if elapsed < time.Hour {
+		minutes := int(elapsed.Minutes())
+		if minutes == 1 {
+			return "1 minute ago"
+		}
+		return fmt.Sprintf("%d minutes ago", minutes)
+	} else if elapsed < 24*time.Hour {
+		hours := int(elapsed.Hours())
+		if hours == 1 {
+			return "1 hour ago"
+		}
+		return fmt.Sprintf("%d hours ago", hours)
+	} else {
+		days := int(elapsed.Hours() / 24)
+		if days == 1 {
+			return "1 day ago"
+		}
+		return fmt.Sprintf("%d days ago", days)
 	}
 }
 
