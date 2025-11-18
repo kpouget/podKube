@@ -163,17 +163,26 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 		podNamespace = "pods"
 	}
 
-	// Convert Podman state to Kubernetes phase
+	// Convert Podman state to Kubernetes phase and container state
 	var phase corev1.PodPhase
 	var conditions []corev1.PodCondition
+	var containerState corev1.ContainerState
+	var ready bool = false
+	var restartCount int32 = int32(container.Restarts)
 
 	switch container.State {
 	case "running":
 		phase = corev1.PodRunning
+		ready = true
 		conditions = []corev1.PodCondition{
 			{
 				Type:   corev1.PodReady,
 				Status: corev1.ConditionTrue,
+			},
+		}
+		containerState = corev1.ContainerState{
+			Running: &corev1.ContainerStateRunning{
+				StartedAt: metav1.NewTime(time.Unix(container.StartedAt, 0)),
 			},
 		}
 	case "exited":
@@ -188,6 +197,13 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 				Status: corev1.ConditionFalse,
 			},
 		}
+		containerState = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode:   int32(container.ExitCode),
+				Reason:     "Completed",
+				FinishedAt: metav1.NewTime(time.Unix(container.StartedAt, 0)),
+			},
+		}
 	case "created", "configured":
 		phase = corev1.PodPending
 		conditions = []corev1.PodCondition{
@@ -196,9 +212,19 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 				Status: corev1.ConditionTrue,
 			},
 		}
+		containerState = corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{
+				Reason: "ContainerCreating",
+			},
+		}
 	default:
 		phase = corev1.PodUnknown
 		conditions = []corev1.PodCondition{}
+		containerState = corev1.ContainerState{
+			Waiting: &corev1.ContainerStateWaiting{
+				Reason: "Unknown",
+			},
+		}
 	}
 
 	// Convert creation and start times
@@ -232,6 +258,17 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 			Phase:      phase,
 			Conditions: conditions,
 			StartTime:  startTime,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name:         podName,
+					Image:        container.Image,
+					ImageID:      container.ImageID,
+					ContainerID:  fmt.Sprintf("podman://%s", container.Id),
+					Ready:        ready,
+					RestartCount: restartCount,
+					State:        containerState,
+				},
+			},
 		},
 	}
 

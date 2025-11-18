@@ -395,7 +395,111 @@ func (s *Server) listPods(w http.ResponseWriter, r *http.Request, namespace stri
 		return
 	}
 
-	s.writeJSON(w, podList)
+	// Check if client wants table format (oc get pods uses this)
+	acceptHeader := r.Header.Get("Accept")
+	if strings.Contains(acceptHeader, "as=Table") {
+		table := s.podListToTable(podList)
+		s.writeJSON(w, table)
+	} else {
+		s.writeJSON(w, podList)
+	}
+}
+
+// podListToTable converts a PodList to Table format with custom columns
+func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
+	table := &metav1.Table{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Table",
+			APIVersion: "meta.k8s.io/v1",
+		},
+		ColumnDefinitions: []metav1.TableColumnDefinition{
+			{Name: "Name", Type: "string", Format: "name", Description: "Name must be unique within a namespace"},
+			{Name: "Ready", Type: "string", Description: "The aggregate readiness state of this pod for accepting traffic"},
+			{Name: "Status", Type: "string", Description: "The aggregate status of the containers in this pod"},
+			{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted"},
+			{Name: "Age", Type: "string", Description: "CreationTimestamp is a timestamp representing the server time when this object was created"},
+			{Name: "Image", Type: "string", Description: "The image the container is running", Priority: 1},
+			{Name: "Container-ID", Type: "string", Description: "Container ID", Priority: 1},
+		},
+	}
+
+	// Convert each pod to a table row
+	for _, pod := range podList.Items {
+		// Calculate age
+		age := "<unknown>"
+		if !pod.CreationTimestamp.IsZero() {
+			age = translateTimestampSince(pod.CreationTimestamp)
+		}
+
+		// Get container info
+		image := "<none>"
+		containerID := "<none>"
+		readyContainers := 0
+		totalContainers := len(pod.Status.ContainerStatuses)
+		restarts := int32(0)
+
+		if len(pod.Status.ContainerStatuses) > 0 {
+			containerStatus := pod.Status.ContainerStatuses[0]
+			image = containerStatus.Image
+			if containerStatus.ContainerID != "" {
+				// Extract short container ID
+				fullID := containerStatus.ContainerID
+				if strings.HasPrefix(fullID, "podman://") {
+					shortID := strings.TrimPrefix(fullID, "podman://")
+					if len(shortID) >= 12 {
+						containerID = shortID[:12]
+					} else {
+						containerID = shortID
+					}
+				} else {
+					containerID = fullID
+				}
+			}
+			restarts = containerStatus.RestartCount
+			if containerStatus.Ready {
+				readyContainers++
+			}
+		}
+
+		// Format ready status as "x/y"
+		ready := fmt.Sprintf("%d/%d", readyContainers, totalContainers)
+
+		// Create table row
+		row := metav1.TableRow{
+			Cells: []interface{}{
+				pod.Name,
+				ready,
+				string(pod.Status.Phase),
+				restarts,
+				age,
+				image,
+				containerID,
+			},
+		}
+		table.Rows = append(table.Rows, row)
+	}
+
+	return table
+}
+
+// translateTimestampSince returns the elapsed time since timestamp in human-readable approximation
+func translateTimestampSince(timestamp metav1.Time) string {
+	if timestamp.IsZero() {
+		return "<unknown>"
+	}
+
+	elapsed := time.Since(timestamp.Time)
+
+	// Convert to common time units
+	if elapsed < time.Minute {
+		return fmt.Sprintf("%ds", int(elapsed.Seconds()))
+	} else if elapsed < time.Hour {
+		return fmt.Sprintf("%dm", int(elapsed.Minutes()))
+	} else if elapsed < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(elapsed.Hours()))
+	} else {
+		return fmt.Sprintf("%dd", int(elapsed.Hours()/24))
+	}
 }
 
 // getPod retrieves a specific pod
@@ -411,7 +515,21 @@ func (s *Server) getPod(w http.ResponseWriter, r *http.Request, namespace, name 
 		return
 	}
 
-	s.writeJSON(w, pod)
+	// Check if client wants table format (oc get pod uses this)
+	acceptHeader := r.Header.Get("Accept")
+	if strings.Contains(acceptHeader, "as=Table") {
+		podList := &corev1.PodList{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "PodList",
+				APIVersion: "v1",
+			},
+			Items: []corev1.Pod{*pod},
+		}
+		table := s.podListToTable(podList)
+		s.writeJSON(w, table)
+	} else {
+		s.writeJSON(w, pod)
+	}
 }
 
 // createPod creates a new pod

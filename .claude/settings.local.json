@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(./server:*)",
-      "Bash(make run-bg:*)"
+      "Bash(make run-bg:*)",
+      "Bash(make build:*)"
     ],
     "deny": [],
     "ask": []
