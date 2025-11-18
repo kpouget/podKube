@@ -120,3 +120,126 @@ func (ps *PodStorage) removePodmanContainer(name string) error {
 	klog.Infof("Deleted container %s", name)
 	return nil
 }
+
+// getPodmanSecrets calls podman secret ls with custom format to get secrets
+func (ps *PodStorage) getPodmanSecrets() ([]PodmanSecret, error) {
+	cmd := exec.Command("podman", "secret", "ls", "--format", "{{.ID}}\t{{.Name}}\t{{.Driver}}\t{{.CreatedAt}}\t{{.UpdatedAt}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run podman secret ls: %v", err)
+	}
+
+	// Handle empty output (no secrets)
+	outputStr := strings.TrimSpace(string(output))
+	if len(outputStr) == 0 {
+		return []PodmanSecret{}, nil
+	}
+
+	var secrets []PodmanSecret
+	lines := strings.Split(outputStr, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		parts := strings.Split(line, "\t")
+		if len(parts) >= 5 {
+			secret := PodmanSecret{
+				ID:        parts[0],
+				Name:      parts[1],
+				Driver:    parts[2],
+				CreatedAt: parts[3],
+				UpdatedAt: parts[4],
+			}
+			secrets = append(secrets, secret)
+		}
+	}
+
+	return secrets, nil
+}
+
+// getPodmanSecret gets details for a specific secret by name
+func (ps *PodStorage) getPodmanSecret(secretName string) (*PodmanSecret, error) {
+	secrets, err := ps.getPodmanSecrets()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, secret := range secrets {
+		if secret.Name == secretName {
+			return &secret, nil
+		}
+	}
+
+	return nil, fmt.Errorf("secret %s not found", secretName)
+}
+
+// createPodmanSecret creates a Podman secret
+func (ps *PodStorage) createPodmanSecret(secret *corev1.Secret) error {
+	// Validate secret data - must have exactly one key named "data"
+	if len(secret.Data) == 0 {
+		return fmt.Errorf("secret must contain data")
+	}
+
+	if len(secret.Data) > 1 {
+		return fmt.Errorf("secret must contain exactly one data entry, got %d", len(secret.Data))
+	}
+
+	// Check that the single key is named "data"
+	var secretValue []byte
+	for key, value := range secret.Data {
+		if key != "data" {
+			return fmt.Errorf("secret key must be 'data', got '%s'", key)
+		}
+		secretValue = value
+		break
+	}
+
+	// Create secret using echo and pipe (use -n to avoid trailing newline)
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo -n '%s' | podman secret create %s -", string(secretValue), secret.Name))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to create secret %s: %v", secret.Name, err)
+	}
+
+	klog.Infof("Created secret %s", secret.Name)
+	return nil
+}
+
+// getPodmanSecretData retrieves the actual secret data by temporarily mounting it in a container
+func (ps *PodStorage) getPodmanSecretData(secretName string) (map[string][]byte, error) {
+	// Create a temporary container to access the secret data
+	// Use a minimal image and mount the secret to read its content
+	containerName := fmt.Sprintf("temp-secret-reader-%s", secretName)
+
+	// Run a temporary container that mounts the secret and outputs its content
+	cmd := exec.Command("podman", "run", "--rm", "--name", containerName,
+		"--secret", fmt.Sprintf("%s,type=mount,target=/tmp/secret", secretName),
+		"alpine:latest", "cat", "/tmp/secret")
+
+	output, err := cmd.Output()
+	if err != nil {
+		klog.Warningf("Failed to read secret data for %s: %v", secretName, err)
+		// Return placeholder data if we can't read the secret
+		return map[string][]byte{
+			"data": []byte("stored-in-podman"),
+		}, nil
+	}
+
+	// Always return the raw secret data under the "data" key
+	// Since we now store only the value (ignoring the original key name)
+	return map[string][]byte{
+		"data": output,
+	}, nil
+}
+
+// removePodmanSecret removes a Podman secret
+func (ps *PodStorage) removePodmanSecret(name string) error {
+	rmCmd := exec.Command("podman", "secret", "rm", name)
+	if err := rmCmd.Run(); err != nil {
+		return fmt.Errorf("failed to remove secret %s: %v", name, err)
+	}
+
+	klog.Infof("Deleted secret %s", name)
+	return nil
+}

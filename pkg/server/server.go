@@ -73,6 +73,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/pods", s.handleClusterPods)
 	mux.HandleFunc("/api/v1/namespaces/", s.handleNamespacedResources)
 
+	// Secret API endpoints
+	mux.HandleFunc("/api/v1/secrets", s.handleClusterSecrets)
+
 	// Health and version endpoints
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/readyz", s.handleHealth)
@@ -87,6 +90,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}")
 	klog.Infof("  GET /api/v1/namespaces/{namespace}/pods/{name}/log")
+	klog.Infof("  GET /api/v1/secrets")
+	klog.Infof("  GET /api/v1/namespaces/{namespace}/secrets")
+	klog.Infof("  GET /api/v1/namespaces/{namespace}/secrets/{name}")
 	klog.Infof("  GET /healthz, /readyz, /livez")
 	klog.Infof("  GET /version")
 }
@@ -176,6 +182,13 @@ func (s *Server) handleAPIV1Discovery(w http.ResponseWriter, r *http.Request) {
 				Kind:         "Pod",
 				Verbs:        []string{"get", "list", "create", "update", "patch", "delete", "deletecollection", "watch"},
 				Categories:   []string{"all"},
+			},
+			{
+				Name:         "secrets",
+				SingularName: "secret",
+				Namespaced:   true,
+				Kind:         "Secret",
+				Verbs:        []string{"get", "list", "create", "delete"},
 			},
 		},
 	}
@@ -324,6 +337,18 @@ func (s *Server) handleClusterPods(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleClusterSecrets handles requests to /api/v1/secrets (cluster-wide secrets)
+func (s *Server) handleClusterSecrets(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.listSecrets(w, r, "")
+	case http.MethodPost:
+		s.createSecret(w, r, "")
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // handleNamespacedResources handles requests to /api/v1/namespaces/{namespace}/...
 func (s *Server) handleNamespacedResources(w http.ResponseWriter, r *http.Request) {
 	// Parse the path: /api/v1/namespaces/{namespace}/{resource}[/{name}]
@@ -338,35 +363,56 @@ func (s *Server) handleNamespacedResources(w http.ResponseWriter, r *http.Reques
 	namespace := parts[0]
 	resource := parts[1]
 
-	// Only handle pods for now
-	if resource != "pods" {
-		http.NotFound(w, r)
+	// Handle pods
+	if resource == "pods" {
+		// Handle pod logs requests: /api/v1/namespaces/{namespace}/pods/{name}/log
+		if len(parts) == 4 && parts[3] == "log" {
+			podName := parts[2]
+			s.handlePodLogs(w, r, namespace, podName)
+			return
+		}
+
+		// Handle specific pod requests
+		if len(parts) == 3 {
+			podName := parts[2]
+			s.handlePodByName(w, r, namespace, podName)
+			return
+		}
+
+		// Handle pod list for namespace
+		switch r.Method {
+		case http.MethodGet:
+			s.listPods(w, r, namespace)
+		case http.MethodPost:
+			s.createPod(w, r, namespace)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 		return
 	}
 
-	// Handle pod logs requests: /api/v1/namespaces/{namespace}/pods/{name}/log
-	if len(parts) == 4 && parts[3] == "log" {
-		podName := parts[2]
-		s.handlePodLogs(w, r, namespace, podName)
+	// Handle secrets
+	if resource == "secrets" {
+		// Handle specific secret requests
+		if len(parts) == 3 {
+			secretName := parts[2]
+			s.handleSecretByName(w, r, namespace, secretName)
+			return
+		}
+
+		// Handle secret list for namespace
+		switch r.Method {
+		case http.MethodGet:
+			s.listSecrets(w, r, namespace)
+		case http.MethodPost:
+			s.createSecret(w, r, namespace)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
 		return
 	}
 
-	// Handle specific pod requests
-	if len(parts) == 3 {
-		podName := parts[2]
-		s.handlePodByName(w, r, namespace, podName)
-		return
-	}
-
-	// Handle pod list for namespace
-	switch r.Method {
-	case http.MethodGet:
-		s.listPods(w, r, namespace)
-	case http.MethodPost:
-		s.createPod(w, r, namespace)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
+	http.NotFound(w, r)
 }
 
 // handlePodByName handles requests for specific pods
@@ -865,6 +911,110 @@ func (s *Server) streamPodmanLogs(w http.ResponseWriter, r *http.Request, cmd *e
 
 	// Wait for command to finish
 	cmd.Wait()
+}
+
+// handleSecretByName handles requests for specific secrets
+func (s *Server) handleSecretByName(w http.ResponseWriter, r *http.Request, namespace, name string) {
+	switch r.Method {
+	case http.MethodGet:
+		s.getSecret(w, r, namespace, name)
+	case http.MethodDelete:
+		s.deleteSecret(w, r, namespace, name)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// listSecrets lists secrets, optionally filtered by namespace
+func (s *Server) listSecrets(w http.ResponseWriter, r *http.Request, namespace string) {
+	secretList, err := s.podStorage.ListSecrets(namespace)
+	if err != nil {
+		klog.Errorf("Failed to list secrets: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to list secrets: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	s.writeJSON(w, secretList)
+}
+
+// getSecret retrieves a specific secret
+func (s *Server) getSecret(w http.ResponseWriter, r *http.Request, namespace, name string) {
+	secret, err := s.podStorage.GetSecret(namespace, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, fmt.Sprintf(`secrets "%s" not found`, name), http.StatusNotFound)
+		} else {
+			klog.Errorf("Failed to get secret %s/%s: %v", namespace, name, err)
+			http.Error(w, fmt.Sprintf("Failed to get secret: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	s.writeJSON(w, secret)
+}
+
+// createSecret creates a new secret
+func (s *Server) createSecret(w http.ResponseWriter, r *http.Request, namespace string) {
+	var secret corev1.Secret
+	if err := json.NewDecoder(r.Body).Decode(&secret); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to decode secret: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Set namespace from URL if not specified in the secret
+	if secret.Namespace == "" {
+		secret.Namespace = namespace
+	}
+
+	// Validate namespace matches URL
+	if namespace != "" && secret.Namespace != namespace {
+		http.Error(w, "Secret namespace does not match URL namespace", http.StatusBadRequest)
+		return
+	}
+
+	createdSecret, err := s.podStorage.CreateSecret(&secret)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			http.Error(w, err.Error(), http.StatusConflict)
+		} else {
+			klog.Errorf("Failed to create secret: %v", err)
+			http.Error(w, fmt.Sprintf("Failed to create secret: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	if err := json.NewEncoder(w).Encode(createdSecret); err != nil {
+		klog.Errorf("Failed to encode created secret: %v", err)
+	}
+}
+
+// deleteSecret deletes a secret
+func (s *Server) deleteSecret(w http.ResponseWriter, r *http.Request, namespace, name string) {
+	err := s.podStorage.DeleteSecret(namespace, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			http.Error(w, fmt.Sprintf(`secrets "%s" not found`, name), http.StatusNotFound)
+		} else {
+			klog.Errorf("Failed to delete secret %s/%s: %v", namespace, name, err)
+			http.Error(w, fmt.Sprintf("Failed to delete secret: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Return success status with proper Kubernetes Status object
+	status := &metav1.Status{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Status",
+			APIVersion: "v1",
+		},
+		Status:  "Success",
+		Code:    200,
+		Message: fmt.Sprintf(`secret "%s" deleted`, name),
+	}
+
+	s.writeJSON(w, status)
 }
 
 // handleHealth handles health check requests
