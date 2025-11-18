@@ -3,7 +3,9 @@
     "allow": [
       "Bash(./server:*)",
       "Bash(make run-bg:*)",
-      "Bash(make build:*)"
+      "Bash(make build:*)",
+      "Bash(make stop:*)",
+      "Bash(pkill:*)"
     ],
     "deny": [],
     "ask": []
