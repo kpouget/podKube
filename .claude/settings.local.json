@@ -5,7 +5,8 @@
       "Bash(make run-bg:*)",
       "Bash(make build:*)",
       "Bash(make stop:*)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(oc exec:*)"
     ],
     "deny": [],
     "ask": []
