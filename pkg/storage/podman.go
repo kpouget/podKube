@@ -62,7 +62,9 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 			podSpec = podmanPod.Spec
 		}
 
-		if container.State == "exited" {
+		// Keep debug pods in main namespace even when exited so watch can find them
+		_, hasDebugAnnotation := ps.mergeAnnotations(container)["debug.openshift.io/source-container"]
+		if container.State == "exited" && !hasDebugAnnotation {
 			podNamespace = "containers-exited"
 		}
 	} else {
@@ -90,10 +92,31 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 	case "running":
 		phase = corev1.PodRunning
 		ready = true
+		now := metav1.NewTime(time.Unix(container.StartedAt, 0))
 		conditions = []corev1.PodCondition{
 			{
-				Type:   corev1.PodReady,
-				Status: corev1.ConditionTrue,
+				Type:               corev1.PodScheduled,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "PodScheduled",
+			},
+			{
+				Type:               corev1.PodInitialized,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "PodInitialized",
+			},
+			{
+				Type:               corev1.ContainersReady,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "ContainersReady",
+			},
+			{
+				Type:               corev1.PodReady,
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: now,
+				Reason:             "PodReady",
 			},
 		}
 		containerState = corev1.ContainerState{
@@ -161,10 +184,11 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 			APIVersion: "v1",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: podNamespace,
-			Labels:    container.Labels, // Use Podman labels directly
-			Annotations: ps.mergeAnnotations(container),
+			Name:            podName,
+			Namespace:       podNamespace,
+			Labels:          container.Labels, // Use Podman labels directly
+			Annotations:     ps.mergeAnnotations(container),
+			ResourceVersion: container.Id[:12], // Use container ID prefix as resourceVersion
 		},
 		Spec: podSpec,
 		Status: corev1.PodStatus{

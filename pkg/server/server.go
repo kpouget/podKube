@@ -501,12 +501,13 @@ func (s *Server) listPods(w http.ResponseWriter, r *http.Request, namespace stri
 
 // watchPods handles watch requests for pods
 func (s *Server) watchPods(w http.ResponseWriter, r *http.Request, namespace, labelSelector, fieldSelector string) {
-	klog.Infof("Starting watch for pods in namespace %q", namespace)
+	klog.Infof("Starting watch for pods in namespace %q with fieldSelector=%q labelSelector=%q", namespace, fieldSelector, labelSelector)
 
-	// Set headers for streaming
-	w.Header().Set("Content-Type", "application/json")
+	// Set headers for streaming (Kubernetes watch format)
+	w.Header().Set("Content-Type", "application/json;stream=watch")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Transfer-Encoding", "chunked")
 
 	// Check if we can flush responses
 	flusher, ok := w.(http.Flusher)
@@ -530,21 +531,54 @@ func (s *Server) watchPods(w http.ResponseWriter, r *http.Request, namespace, la
 		return
 	}
 
+	klog.Infof("Watch DEBUG: Found %d pods matching filters", len(podList.Items))
+	for i, pod := range podList.Items {
+		klog.Infof("Watch DEBUG: Pod[%d]: name=%s namespace=%s phase=%s", i, pod.Name, pod.Namespace, pod.Status.Phase)
+	}
+
 	encoder := json.NewEncoder(w)
 
-	// Don't send initial ADDED events - the client already got the current state
-	// from a previous list call. Just establish baseline for change detection.
-	klog.V(2).Infof("Watch starting - establishing baseline from %d existing pods (no initial events sent)", len(podList.Items))
+	// Send initial ADDED events for existing pods that match the selectors
+	// This is correct Kubernetes watch behavior
+	klog.Infof("Watch starting - sending initial ADDED events for %d existing pods", len(podList.Items))
 
 	// Keep track of previous pods for change detection
 	previousPods := make(map[string]*corev1.Pod)
+
+	// Send initial ADDED events for existing pods
 	for _, pod := range podList.Items {
-		// Use the pod's actual namespace instead of the request parameter
 		key := s.podKey(pod.Namespace, pod.Name)
 		previousPods[key] = pod.DeepCopy()
-		klog.V(2).Infof("Stored initial pod state: key=%s, name=%s, namespace=%s", key, pod.Name, pod.Namespace)
+
+		// Send ADDED event for this existing pod
+		if isTableFormat {
+			singlePodList := &corev1.PodList{
+				Items: []corev1.Pod{pod},
+			}
+			table := s.podListToTable(singlePodList)
+			event := &metav1.WatchEvent{
+				Type:   string(watch.Added),
+				Object: *s.tableRowToRawExtension(table, 0),
+			}
+			encoder.Encode(event)
+			flusher.Flush()
+		} else {
+			event := &metav1.WatchEvent{
+				Type:   string(watch.Added),
+				Object: *s.podToRawExtension(&pod),
+			}
+			// Write JSON directly to ensure proper streaming
+			if eventJSON, err := json.Marshal(event); err == nil {
+				klog.Infof("Watch DEBUG: Sending event JSON: %s", string(eventJSON))
+				w.Write(eventJSON)
+				w.Write([]byte("\n"))
+				flusher.Flush()
+			} else {
+				klog.Errorf("Failed to marshal watch event: %v", err)
+			}
+		}
+		klog.Infof("Sent initial ADDED event for pod %s", key)
 	}
-	klog.V(2).Infof("Stored %d pods in initial state for watch", len(previousPods))
 
 	// Keep connection alive and watch for changes
 	ticker := time.NewTicker(5 * time.Second) // Check more frequently for changes

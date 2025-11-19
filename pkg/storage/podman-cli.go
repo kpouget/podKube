@@ -128,8 +128,23 @@ func (ps *PodStorage) createPodmanContainer(pod *corev1.Pod) (string, error) {
 
 	// Add the image and command
 	args = append(args, container.Image)
+
+	// Use the specified command from the container spec
 	if len(container.Command) > 0 {
-		args = append(args, container.Command...)
+		// For debug pods with specific commands, we need to keep them running
+		// so that oc debug can attach and capture output
+		if _, hasDebugAnnotation := pod.Annotations["debug.openshift.io/source-container"]; hasDebugAnnotation {
+			klog.Infof("Debug pod %s: wrapping command to allow attachment", pod.Name)
+			// Wrap the command in a shell that stays open briefly for attachment
+			args = append(args, "/bin/sh", "-c",
+				fmt.Sprintf("(%s) & pid=$!; sleep 2; wait $pid", strings.Join(container.Command, " ")))
+		} else {
+			args = append(args, container.Command...)
+		}
+	} else {
+		// If no command specified, use sleep to keep container running for interactive debugging
+		klog.Infof("No command specified for pod %s: using sleep to keep container alive", pod.Name)
+		args = append(args, "sleep", "3600")
 	}
 
 	// Run the container
