@@ -25,9 +25,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/httpstream/spdy"
 	remotecommandconsts "k8s.io/apimachinery/pkg/util/remotecommand"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/klog/v2"
 
 	"podman-k8s-adapter/pkg/storage"
@@ -472,6 +474,13 @@ func (s *Server) handlePodByName(w http.ResponseWriter, r *http.Request, namespa
 func (s *Server) listPods(w http.ResponseWriter, r *http.Request, namespace string) {
 	labelSelector := r.URL.Query().Get("labelSelector")
 	fieldSelector := r.URL.Query().Get("fieldSelector")
+	watchParam := r.URL.Query().Get("watch")
+
+	// Handle watch requests
+	if watchParam == "true" {
+		s.watchPods(w, r, namespace, labelSelector, fieldSelector)
+		return
+	}
 
 	podList, err := s.podStorage.List(namespace, labelSelector, fieldSelector)
 	if err != nil {
@@ -487,6 +496,351 @@ func (s *Server) listPods(w http.ResponseWriter, r *http.Request, namespace stri
 		s.writeJSON(w, table)
 	} else {
 		s.writeJSON(w, podList)
+	}
+}
+
+// watchPods handles watch requests for pods
+func (s *Server) watchPods(w http.ResponseWriter, r *http.Request, namespace, labelSelector, fieldSelector string) {
+	klog.Infof("Starting watch for pods in namespace %q", namespace)
+
+	// Set headers for streaming
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Check if we can flush responses
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	// Check if client wants table format
+	acceptHeader := r.Header.Get("Accept")
+	isTableFormat := strings.Contains(acceptHeader, "as=Table")
+
+	// Write response header
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	// Get current pods and send them as ADDED events
+	podList, err := s.podStorage.List(namespace, labelSelector, fieldSelector)
+	if err != nil {
+		klog.Errorf("Failed to list pods for watch: %v", err)
+		return
+	}
+
+	encoder := json.NewEncoder(w)
+
+	// Don't send initial ADDED events - the client already got the current state
+	// from a previous list call. Just establish baseline for change detection.
+	klog.V(2).Infof("Watch starting - establishing baseline from %d existing pods (no initial events sent)", len(podList.Items))
+
+	// Keep track of previous pods for change detection
+	previousPods := make(map[string]*corev1.Pod)
+	for _, pod := range podList.Items {
+		// Use the pod's actual namespace instead of the request parameter
+		key := s.podKey(pod.Namespace, pod.Name)
+		previousPods[key] = pod.DeepCopy()
+		klog.V(2).Infof("Stored initial pod state: key=%s, name=%s, namespace=%s", key, pod.Name, pod.Namespace)
+	}
+	klog.V(2).Infof("Stored %d pods in initial state for watch", len(previousPods))
+
+	// Keep connection alive and watch for changes
+	ticker := time.NewTicker(5 * time.Second) // Check more frequently for changes
+	defer ticker.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			klog.Infof("Watch connection closed by client")
+			return
+		case <-ticker.C:
+			// Check for actual changes
+			currentPods, err := s.podStorage.List(namespace, labelSelector, fieldSelector)
+			if err != nil {
+				klog.Errorf("Failed to refresh pods during watch: %v", err)
+				continue
+			}
+
+			// Detect changes and send appropriate events
+			changes := s.detectPodChanges(previousPods, currentPods.Items)
+
+			if len(changes) > 0 {
+				klog.V(2).Infof("Detected %d pod changes", len(changes))
+
+				if isTableFormat {
+					// Send table format events for changes only
+					table := s.podListToTable(currentPods)
+					podIndexMap := make(map[string]int)
+					for i, pod := range currentPods.Items {
+						key := s.podKey(pod.Namespace, pod.Name)
+						podIndexMap[key] = i
+					}
+
+					for _, change := range changes {
+						var event *metav1.WatchEvent
+
+						switch change.Type {
+						case string(watch.Added), string(watch.Modified):
+							if idx, exists := podIndexMap[change.Key]; exists {
+								event = &metav1.WatchEvent{
+									Type:   change.Type,
+									Object: *s.tableRowToRawExtension(table, idx),
+								}
+							}
+						case string(watch.Deleted):
+							// For deleted pods, create a minimal table row
+							deletedTable := s.createDeletedPodTable(change.Pod)
+							event = &metav1.WatchEvent{
+								Type:   change.Type,
+								Object: *s.tableRowToRawExtension(deletedTable, 0),
+							}
+						}
+
+						if event != nil {
+							if err := encoder.Encode(event); err != nil {
+								klog.Errorf("Failed to encode watch event: %v", err)
+								return
+							}
+							flusher.Flush()
+						}
+					}
+				} else {
+					// Send regular pod format events for changes only
+					for _, change := range changes {
+						event := &metav1.WatchEvent{
+							Type:   change.Type,
+							Object: *s.podToRawExtension(change.Pod),
+						}
+						if err := encoder.Encode(event); err != nil {
+							klog.Errorf("Failed to encode watch event: %v", err)
+							return
+						}
+						flusher.Flush()
+					}
+				}
+			}
+
+			// Update previous pods state
+			previousPods = make(map[string]*corev1.Pod)
+			for _, pod := range currentPods.Items {
+				key := s.podKey(pod.Namespace, pod.Name)
+				previousPods[key] = pod.DeepCopy()
+			}
+		}
+	}
+}
+
+// PodChange represents a change detected in pod state
+type PodChange struct {
+	Type string
+	Key  string
+	Pod  *corev1.Pod
+}
+
+// podKey creates a unique key for a pod
+func (s *Server) podKey(namespace, name string) string {
+	if namespace == "" {
+		return name
+	}
+	return namespace + "/" + name
+}
+
+// detectPodChanges compares previous and current pods and returns changes
+func (s *Server) detectPodChanges(previousPods map[string]*corev1.Pod, currentPods []corev1.Pod) []PodChange {
+	var changes []PodChange
+	currentPodMap := make(map[string]*corev1.Pod)
+
+	// Build current pods map using each pod's actual namespace
+	for i := range currentPods {
+		key := s.podKey(currentPods[i].Namespace, currentPods[i].Name)
+		currentPodMap[key] = &currentPods[i]
+	}
+
+	klog.V(2).Infof("Comparing pods: previous=%d, current=%d", len(previousPods), len(currentPodMap))
+
+	// Check for new or modified pods
+	for key, currentPod := range currentPodMap {
+		if previousPod, existed := previousPods[key]; existed {
+			// Check if pod actually changed
+			if s.podChanged(previousPod, currentPod) {
+				klog.V(2).Infof("Pod modified: %s", key)
+				changes = append(changes, PodChange{
+					Type: string(watch.Modified),
+					Key:  key,
+					Pod:  currentPod,
+				})
+			} else {
+				klog.V(4).Infof("Pod unchanged: %s", key)
+			}
+		} else {
+			klog.V(2).Infof("New pod detected: %s (this shouldn't happen on first poll)", key)
+			changes = append(changes, PodChange{
+				Type: string(watch.Added),
+				Key:  key,
+				Pod:  currentPod,
+			})
+		}
+	}
+
+	// Check for deleted pods
+	for key, previousPod := range previousPods {
+		if _, exists := currentPodMap[key]; !exists {
+			klog.V(2).Infof("Pod deleted: %s", key)
+			changes = append(changes, PodChange{
+				Type: string(watch.Deleted),
+				Key:  key,
+				Pod:  previousPod,
+			})
+		}
+	}
+
+	return changes
+}
+
+// podChanged checks if a pod has actually changed in meaningful ways
+func (s *Server) podChanged(previous, current *corev1.Pod) bool {
+	// Don't check ResourceVersion - it changes too frequently for internal reasons
+
+	// Check status phase
+	if previous.Status.Phase != current.Status.Phase {
+		klog.V(2).Infof("Pod %s: Phase changed %s -> %s", current.Name, previous.Status.Phase, current.Status.Phase)
+		return true
+	}
+
+	// Check container statuses count
+	if len(previous.Status.ContainerStatuses) != len(current.Status.ContainerStatuses) {
+		klog.V(2).Infof("Pod %s: Container status count changed %d -> %d", current.Name, len(previous.Status.ContainerStatuses), len(current.Status.ContainerStatuses))
+		return true
+	}
+
+	// Check meaningful container status changes
+	for i, prevStatus := range previous.Status.ContainerStatuses {
+		if i < len(current.Status.ContainerStatuses) {
+			currStatus := current.Status.ContainerStatuses[i]
+			if prevStatus.Ready != currStatus.Ready {
+				klog.V(2).Infof("Pod %s container %d: Ready changed %t -> %t", current.Name, i, prevStatus.Ready, currStatus.Ready)
+				return true
+			}
+			if prevStatus.RestartCount != currStatus.RestartCount {
+				klog.V(2).Infof("Pod %s container %d: RestartCount changed %d -> %d", current.Name, i, prevStatus.RestartCount, currStatus.RestartCount)
+				return true
+			}
+			// Don't check ContainerID changes - containers can be restarted with same restart count
+		}
+	}
+
+	// Check if pod condition changed (like Ready condition)
+	prevConditions := s.getPodConditionSummary(previous)
+	currConditions := s.getPodConditionSummary(current)
+	if prevConditions != currConditions {
+		klog.V(2).Infof("Pod %s: Conditions changed %s -> %s", current.Name, prevConditions, currConditions)
+		return true
+	}
+
+	return false
+}
+
+// getPodConditionSummary returns a summary string of pod conditions for comparison
+func (s *Server) getPodConditionSummary(pod *corev1.Pod) string {
+	var conditions []string
+	for _, condition := range pod.Status.Conditions {
+		if condition.Status == corev1.ConditionTrue {
+			conditions = append(conditions, string(condition.Type))
+		}
+	}
+	return strings.Join(conditions, ",")
+}
+
+// createDeletedPodTable creates a table representation for a deleted pod
+func (s *Server) createDeletedPodTable(pod *corev1.Pod) *metav1.Table {
+	table := &metav1.Table{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Table",
+			APIVersion: "meta.k8s.io/v1",
+		},
+		ColumnDefinitions: []metav1.TableColumnDefinition{
+			{Name: "Name", Type: "string", Format: "name", Description: "Name must be unique within a namespace"},
+			{Name: "Ready", Type: "string", Description: "The aggregate readiness state of this pod for accepting traffic"},
+			{Name: "Status", Type: "string", Description: "The aggregate status of the containers in this pod"},
+			{Name: "Restarts", Type: "integer", Description: "The number of times the containers in this pod have been restarted", Priority: 1},
+			{Name: "Age", Type: "string", Description: "Time since the container started running"},
+			{Name: "Created", Type: "string", Description: "When the container was created"},
+			{Name: "Image", Type: "string", Description: "The image the container is running", Priority: 1},
+			{Name: "Command", Type: "string", Description: "The command the container is running", Priority: 1},
+			{Name: "Ports", Type: "string", Description: "The ports exposed by the container", Priority: 1},
+			{Name: "Container-ID", Type: "string", Description: "Container ID", Priority: 1},
+		},
+		Rows: []metav1.TableRow{
+			{
+				Cells: []interface{}{
+					pod.Name,
+					"0/0",
+					"Terminating",
+					0,
+					"<unknown>",
+					"<unknown>",
+					"<none>",
+					"<none>",
+					"<none>",
+					"<none>",
+				},
+			},
+		},
+	}
+	return table
+}
+
+// podToRawExtension converts a pod to a runtime.RawExtension for watch events
+func (s *Server) podToRawExtension(pod *corev1.Pod) *runtime.RawExtension {
+	// Ensure the pod has proper TypeMeta
+	if pod.Kind == "" {
+		pod.Kind = "Pod"
+	}
+	if pod.APIVersion == "" {
+		pod.APIVersion = "v1"
+	}
+
+	// Convert pod to JSON
+	podBytes, err := json.Marshal(pod)
+	if err != nil {
+		klog.Errorf("Failed to marshal pod for watch event: %v", err)
+		return &runtime.RawExtension{}
+	}
+
+	return &runtime.RawExtension{
+		Raw: podBytes,
+	}
+}
+
+// tableRowToRawExtension converts a table row to a runtime.RawExtension for watch events
+func (s *Server) tableRowToRawExtension(table *metav1.Table, rowIndex int) *runtime.RawExtension {
+	if rowIndex >= len(table.Rows) {
+		klog.Errorf("Row index %d out of bounds for table with %d rows", rowIndex, len(table.Rows))
+		return &runtime.RawExtension{}
+	}
+
+	// Create a table with just this one row but same column definitions
+	singleRowTable := &metav1.Table{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Table",
+			APIVersion: "meta.k8s.io/v1",
+		},
+		ColumnDefinitions: table.ColumnDefinitions,
+		Rows:              []metav1.TableRow{table.Rows[rowIndex]},
+	}
+
+	// Convert table to JSON
+	tableBytes, err := json.Marshal(singleRowTable)
+	if err != nil {
+		klog.Errorf("Failed to marshal table row for watch event: %v", err)
+		return &runtime.RawExtension{}
+	}
+
+	return &runtime.RawExtension{
+		Raw: tableBytes,
 	}
 }
 
