@@ -30,6 +30,7 @@ type PodmanContainer struct {
 	State         string                 `json:"State"`
 	Status        string                 `json:"Status"`
 	Created       int64                  `json:"Created"`
+	Annotations   map[string]string      `json:"Annotations,omitempty"` // Container annotations from inspect
 }
 
 
@@ -163,10 +164,7 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 			Name:      podName,
 			Namespace: podNamespace,
 			Labels:    container.Labels, // Use Podman labels directly
-			Annotations: map[string]string{
-				"podman.io/container-id": container.Id,
-				"podman.io/image-id":     container.ImageID,
-			},
+			Annotations: ps.mergeAnnotations(container),
 		},
 		Spec: podSpec,
 		Status: corev1.PodStatus{
@@ -192,4 +190,21 @@ func (ps *PodStorage) podmanContainerToPod(container *PodmanContainer) *corev1.P
 	}
 
 	return pod
+}
+
+// mergeAnnotations merges container annotations with podman.io annotations
+func (ps *PodStorage) mergeAnnotations(container *PodmanContainer) map[string]string {
+	annotations := map[string]string{
+		"podman.io/container-id": container.Id,
+		"podman.io/image-id":     container.ImageID,
+	}
+
+	// Add container annotations if they exist
+	if container.Annotations != nil {
+		for key, value := range container.Annotations {
+			annotations[key] = value
+		}
+	}
+
+	return annotations
 }

@@ -24,7 +24,47 @@ func (ps *PodStorage) getPodmanContainers() ([]PodmanContainer, error) {
 		return nil, fmt.Errorf("failed to parse podman output: %v", err)
 	}
 
+	// Enhance each container with detailed annotations from inspect
+	for i := range containers {
+		if annotations, err := ps.getPodmanContainerAnnotations(containers[i].Id); err == nil {
+			containers[i].Annotations = annotations
+		} else {
+			klog.Warningf("Failed to get annotations for container %s: %v", containers[i].Id, err)
+		}
+	}
+
 	return containers, nil
+}
+
+// getPodmanContainerAnnotations gets annotations for a specific container using inspect
+func (ps *PodStorage) getPodmanContainerAnnotations(containerID string) (map[string]string, error) {
+	cmd := exec.Command("podman", "inspect", containerID)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect container %s: %v", containerID, err)
+	}
+
+	// Parse the inspect output to get annotations
+	var inspectResult []struct {
+		Config struct {
+			Annotations map[string]string `json:"Annotations"`
+		} `json:"Config"`
+	}
+
+	if err := json.Unmarshal(output, &inspectResult); err != nil {
+		return nil, fmt.Errorf("failed to parse inspect output: %v", err)
+	}
+
+	if len(inspectResult) == 0 {
+		return map[string]string{}, nil
+	}
+
+	annotations := inspectResult[0].Config.Annotations
+	if annotations == nil {
+		return map[string]string{}, nil
+	}
+
+	return annotations, nil
 }
 
 // getPodmanK8sContainer calls podman kube generate NAME to get the container details

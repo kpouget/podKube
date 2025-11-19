@@ -772,6 +772,7 @@ func (s *Server) createDeletedPodTable(pod *corev1.Pod) *metav1.Table {
 			{Name: "Command", Type: "string", Description: "The command the container is running", Priority: 1},
 			{Name: "Ports", Type: "string", Description: "The ports exposed by the container", Priority: 1},
 			{Name: "Container-ID", Type: "string", Description: "Container ID", Priority: 1},
+			{Name: "Labels", Type: "string", Description: "Labels assigned to the pod"},
 		},
 		Rows: []metav1.TableRow{
 			{
@@ -786,6 +787,7 @@ func (s *Server) createDeletedPodTable(pod *corev1.Pod) *metav1.Table {
 					"<none>",
 					"<none>",
 					"<none>",
+					s.formatLabelsForTable(pod.Labels),
 				},
 			},
 		},
@@ -947,7 +949,8 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 		// Format ready status as "x/y"
 		ready := fmt.Sprintf("%d/%d", readyContainers, totalContainers)
 
-		// Create table row
+		// Create table row with Object field for --show-labels support
+		podCopy := pod.DeepCopy()
 		row := metav1.TableRow{
 			Cells: []interface{}{
 				pod.Name,
@@ -961,11 +964,35 @@ func (s *Server) podListToTable(podList *corev1.PodList) *metav1.Table {
 				ports,
 				containerID,
 			},
+			Object: runtime.RawExtension{
+				Object: podCopy,
+			},
 		}
 		table.Rows = append(table.Rows, row)
 	}
 
 	return table
+}
+
+// formatLabelsForTable formats pod labels for table display
+func (s *Server) formatLabelsForTable(labels map[string]string) string {
+	if len(labels) == 0 {
+		return "<none>"
+	}
+
+	// Create key=value pairs
+	var labelPairs []string
+	for key, value := range labels {
+		labelPairs = append(labelPairs, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	// Join with commas, but truncate if too long for table display
+	result := strings.Join(labelPairs, ",")
+	if len(result) > 60 { // Limit to 60 characters for table readability
+		result = result[:57] + "..."
+	}
+
+	return result
 }
 
 // translateTimestampSince returns the elapsed time since timestamp in podman ps format
@@ -2252,4 +2279,3 @@ func (s *Server) generateSelfSignedCert() (tls.Certificate, error) {
 
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
-
