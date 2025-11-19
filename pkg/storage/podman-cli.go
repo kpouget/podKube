@@ -121,6 +121,11 @@ func (ps *PodStorage) createPodmanContainer(pod *corev1.Pod) (string, error) {
 		args = append(args, "--label", fmt.Sprintf("%s=%s", key, value))
 	}
 
+	// Add annotations from pod
+	for key, value := range pod.Annotations {
+		args = append(args, "--annotation", fmt.Sprintf("%s=%s", key, value))
+	}
+
 	// Add the image and command
 	args = append(args, container.Image)
 	if len(container.Command) > 0 {
