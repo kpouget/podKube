@@ -20,8 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
+	"github.com/creack/pty"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,19 +39,6 @@ type TerminalSize struct {
 	Height uint16 `json:"height"`
 }
 
-// winsize represents the terminal window size for ioctl calls
-type winsize struct {
-	Row    uint16
-	Col    uint16
-	Xpixel uint16
-	Ypixel uint16
-}
-
-// ioctl constants for terminal operations
-const (
-	TIOCGWINSZ = 0x5413
-	TIOCSWINSZ = 0x5414
-)
 
 // Server represents our Kubernetes API server
 type Server struct {
@@ -942,9 +929,9 @@ func (s *Server) streamPodmanLogs(w http.ResponseWriter, r *http.Request, cmd *e
 	// Note: This will block until the command finishes or the client disconnects
 	buffer := make([]byte, 4096)
 	for {
-		klog.Infof("=== EXEC DEBUG: Reading Stdout ...")
+		klog.V(4).Infof("Reading Stdout ...")
 		n, err := stdout.Read(buffer)
-		klog.Infof("=== EXEC DEBUG: Reading Stdout ...")
+		klog.V(4).Infof("Reading Stdout ...")
 		if n > 0 {
 			w.Write(buffer[:n])
 			flusher.Flush()
@@ -1131,9 +1118,9 @@ func (s *Server) handleInteractiveExec(w http.ResponseWriter, r *http.Request, a
 		defer stdout.Close()
 		buffer := make([]byte, 1024)
 		for {
-			klog.Infof("=== EXEC DEBUG: Reading Stdout(2) ...")
+			klog.V(4).Infof("Reading Stdout(2) ...")
 			n, err := stdout.Read(buffer)
-			klog.Infof("=== EXEC DEBUG: Reading Stdout(2) ... DONE")
+			klog.V(4).Infof("Reading Stdout(2) ... DONE")
 			if n > 0 {
 				w.Write(buffer[:n])
 				flusher.Flush()
@@ -1149,9 +1136,9 @@ func (s *Server) handleInteractiveExec(w http.ResponseWriter, r *http.Request, a
 		defer stderr.Close()
 		buffer := make([]byte, 1024)
 		for {
-			klog.Infof("=== EXEC DEBUG: Reading Stderr ...")
+			klog.V(4).Infof("Reading Stderr ...")
 			n, err := stderr.Read(buffer)
-			klog.Infof("=== EXEC DEBUG: Reading Stderr ... DONE")
+			klog.V(4).Infof("Reading Stderr ... DONE")
 			if n > 0 {
 				w.Write(buffer[:n])
 				flusher.Flush()
@@ -1240,7 +1227,7 @@ func (s *Server) handleSPDYExec(w http.ResponseWriter, r *http.Request, args []s
 	defer ctx.conn.Close()
 
 	// Execute the command with established streams
-	klog.Infof("=== EXEC DEBUG: About to call execInContainer with tty=%t", tty)
+	klog.V(4).Infof("About to call execInContainer with tty=%t", tty)
 	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, tty, ctx.resizeChan)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
@@ -1281,7 +1268,7 @@ func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *E
 		return nil, false
 	}
 
-	klog.Infof("=== EXEC DEBUG: Negotiated protocol: %s for TTY=%t, Stdin=%t, Stdout=%t, Stderr=%t",
+	klog.V(4).Infof("Negotiated protocol: %s for TTY=%t, Stdin=%t, Stdout=%t, Stderr=%t",
 		protocol, opts.TTY, opts.Stdin, opts.Stdout, opts.Stderr)
 
 	streamCh := make(chan streamAndReply)
@@ -1393,22 +1380,22 @@ func (s *Server) waitStreamReply(replySent <-chan struct{}, notify chan<- struct
 func (s *Server) createWriteStatusFunc(stream httpstream.Stream, protocol string) func(status *apierrors.StatusError) error {
 	return func(status *apierrors.StatusError) error {
 		defer func() {
-			klog.Infof("=== EXEC DEBUG: Closing error stream after status write")
+			klog.V(4).Infof("Closing error stream after status write")
 			stream.Close()
 		}()
 
 		if status.Status().Status == metav1.StatusSuccess {
-			klog.Infof("=== EXEC DEBUG: Writing success status with protocol: %s", protocol)
+			klog.V(4).Infof("Writing success status with protocol: %s", protocol)
 		} else {
-			klog.Infof("=== EXEC DEBUG: Writing error status: %s with protocol: %s", status.Error(), protocol)
+			klog.V(4).Infof("Writing error status: %s with protocol: %s", status.Error(), protocol)
 		}
 
 		// For v4+ protocols, write JSON status
 		if protocol == remotecommandconsts.StreamProtocolV4Name {
-			klog.Infof("=== EXEC DEBUG: Using v4 status writing")
+			klog.V(4).Infof("Using v4 status writing")
 			return s.writeV4Status(stream, status)
 		} else {
-			klog.Infof("=== EXEC DEBUG: Using v1 status writing")
+			klog.V(4).Infof("Using v1 status writing")
 			// For older protocols, write simple status
 			return s.writeV1Status(stream, status)
 		}
@@ -1422,7 +1409,7 @@ func (s *Server) writeV4Status(stream httpstream.Stream, status *apierrors.Statu
 		klog.Errorf("=== EXEC DEBUG: v4 Failed to marshal status: %v", err)
 		return err
 	}
-	klog.Infof("=== EXEC DEBUG: v4 Writing JSON status to stream: %s", string(statusBytes))
+	klog.V(4).Infof("v4 Writing JSON status to stream: %s", string(statusBytes))
 	_, err = stream.Write(statusBytes)
 	return err
 }
@@ -1430,18 +1417,18 @@ func (s *Server) writeV4Status(stream httpstream.Stream, status *apierrors.Statu
 // writeV1Status writes status in v1 protocol format (exit code)
 func (s *Server) writeV1Status(stream httpstream.Stream, status *apierrors.StatusError) error {
 	if status.Status().Status != metav1.StatusSuccess {
-		klog.Infof("=== EXEC DEBUG: v1 Writing error to stream: %s", status.Error())
+		klog.V(4).Infof("v1 Writing error to stream: %s", status.Error())
 		_, err := stream.Write([]byte(status.Error()))
 		return err
 	}
-	klog.Infof("=== EXEC DEBUG: v1 Success status - not writing anything to error stream")
+	klog.V(4).Infof("v1 Success status - not writing anything to error stream")
 	return nil
 }
 
 // execInContainer executes the command using the established streams (kubelet-style async stream handling)
 func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, stderr io.WriteCloser, tty bool, resizeChan <-chan TerminalSize) error {
-	klog.Infof("=== EXEC DEBUG: Starting execInContainer with args: %v", args)
-	klog.Infof("=== EXEC DEBUG: Stream setup - stdin: %t, stdout: %t, stderr: %t, tty: %t, resize: %t",
+	klog.V(4).Infof("Starting execInContainer with args: %v", args)
+	klog.V(4).Infof("Stream setup - stdin: %t, stdout: %t, stderr: %t, tty: %t, resize: %t",
 		stdin != nil, stdout != nil, stderr != nil, tty, resizeChan != nil)
 
 	// Create context to cancel goroutines when command completes
@@ -1450,194 +1437,214 @@ func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, std
 
 	cmd := exec.Command("podman", args...)
 	var cmdPid int // Store the podman exec process PID for resize handling
+	var ptyFile *os.File // Store PTY file for resize operations
 
-	// Set up pipes for all streams
-	var stdinPipe io.WriteCloser
-	var stdoutPipe io.ReadCloser
-	var stderrPipe io.ReadCloser
-	var err error
+	// For TTY mode, use a real PTY; otherwise use pipes
+	if tty {
+		klog.V(4).Infof("Creating real PTY for TTY mode")
 
-	if stdin != nil {
-		klog.Infof("=== EXEC DEBUG: Creating stdin pipe")
-		stdinPipe, err = cmd.StdinPipe()
+		// Start the command with a PTY
+		var err error
+		ptyFile, err = pty.Start(cmd)
 		if err != nil {
-			klog.Errorf("=== EXEC DEBUG: Failed to create stdin pipe: %v", err)
-			return fmt.Errorf("failed to create stdin pipe: %v", err)
+			klog.Errorf("=== EXEC DEBUG: Failed to start command with PTY: %v", err)
+			return fmt.Errorf("failed to start command with PTY: %v", err)
 		}
-		klog.Infof("=== EXEC DEBUG: Stdin pipe created successfully")
-	}
+		cmdPid = cmd.Process.Pid
+		klog.V(4).Infof("Podman exec started with PTY, PID: %d", cmdPid)
 
-	if stdout != nil {
-		klog.Infof("=== EXEC DEBUG: Creating stdout pipe")
-		stdoutPipe, err = cmd.StdoutPipe()
+		// Note: Initial PTY size will be set by resize events from the client
+		klog.V(4).Infof("PTY created, waiting for initial resize event from client")
+	} else {
+		klog.V(4).Infof("Using pipes for non-TTY mode")
+
+		// Set up pipes for all streams
+		var stdinPipe io.WriteCloser
+		var stdoutPipe io.ReadCloser
+		var stderrPipe io.ReadCloser
+		var err error
+
+		if stdin != nil {
+			klog.V(4).Infof("Creating stdin pipe")
+			stdinPipe, err = cmd.StdinPipe()
+			if err != nil {
+				klog.Errorf("=== EXEC DEBUG: Failed to create stdin pipe: %v", err)
+				return fmt.Errorf("failed to create stdin pipe: %v", err)
+			}
+			klog.V(4).Infof("Stdin pipe created successfully")
+		}
+
+		if stdout != nil {
+			klog.V(4).Infof("Creating stdout pipe")
+			stdoutPipe, err = cmd.StdoutPipe()
+			if err != nil {
+				klog.Errorf("=== EXEC DEBUG: Failed to create stdout pipe: %v", err)
+				return fmt.Errorf("failed to create stdout pipe: %v", err)
+			}
+			klog.V(4).Infof("Stdout pipe created successfully")
+		}
+
+		if stderr != nil {
+			klog.V(4).Infof("Creating stderr pipe")
+			stderrPipe, err = cmd.StderrPipe()
+			if err != nil {
+				klog.Errorf("=== EXEC DEBUG: Failed to create stderr pipe: %v", err)
+				return fmt.Errorf("failed to create stderr pipe: %v", err)
+			}
+			klog.V(4).Infof("Stderr pipe created successfully")
+		}
+
+		// Start the command
+		klog.V(4).Infof("Starting podman command")
+		err = cmd.Start()
 		if err != nil {
-			klog.Errorf("=== EXEC DEBUG: Failed to create stdout pipe: %v", err)
-			return fmt.Errorf("failed to create stdout pipe: %v", err)
+			klog.Errorf("=== EXEC DEBUG: Failed to start command: %v", err)
+			return err
 		}
-		klog.Infof("=== EXEC DEBUG: Stdout pipe created successfully")
-	}
+		cmdPid = cmd.Process.Pid
+		klog.V(4).Infof("Podman exec command started successfully, PID: %d", cmdPid)
 
-	if stderr != nil && !tty {
-		klog.Infof("=== EXEC DEBUG: Creating stderr pipe")
-		stderrPipe, err = cmd.StderrPipe()
-		if err != nil {
-			klog.Errorf("=== EXEC DEBUG: Failed to create stderr pipe: %v", err)
-			return fmt.Errorf("failed to create stderr pipe: %v", err)
+		// Handle pipe-based streams asynchronously
+		if stdinPipe != nil && stdin != nil {
+			go func() {
+				defer stdinPipe.Close()
+				io.Copy(stdinPipe, stdin)
+			}()
 		}
-		klog.Infof("=== EXEC DEBUG: Stderr pipe created successfully")
-	}
 
-	// Start the command
-	klog.Infof("=== EXEC DEBUG: Starting podman command")
-	err = cmd.Start()
-	if err != nil {
-		klog.Errorf("=== EXEC DEBUG: Failed to start command: %v", err)
-		return err
+		if stdoutPipe != nil && stdout != nil {
+			go func() {
+				defer stdoutPipe.Close()
+				io.Copy(stdout, stdoutPipe)
+			}()
+		}
+
+		if stderrPipe != nil && stderr != nil {
+			go func() {
+				defer stderrPipe.Close()
+				io.Copy(stderr, stderrPipe)
+			}()
+		}
 	}
-	cmdPid = cmd.Process.Pid
-	klog.Infof("=== EXEC DEBUG: Podman exec command started successfully, PID: %d", cmdPid)
 
 	// Handle streams asynchronously (kubelet pattern)
 	var wg sync.WaitGroup
 	streamCount := 0
 
-	// Handle stdin -> command.stdin
-	if stdinPipe != nil && stdin != nil {
-		streamCount++
-		wg.Add(1)
-		klog.Infof("=== EXEC DEBUG: Starting stdin goroutine (%d)", streamCount)
-		go func() {
-			defer wg.Done()
-			defer stdinPipe.Close()
-			klog.Infof("=== EXEC DEBUG: Stdin goroutine: Starting with context cancellation")
-
-			// Use io.Copy but with context cancellation
-			done := make(chan struct{})
+	// For TTY mode, handle PTY streams
+	if tty && ptyFile != nil {
+		// PTY handles both stdin and stdout through the same file
+		if stdin != nil || stdout != nil {
+			streamCount++
+			wg.Add(1)
+			klog.V(4).Infof("Starting PTY stream goroutine (%d)", streamCount)
 			go func() {
-				bytes, err := io.Copy(stdinPipe, stdin)
-				klog.Infof("=== EXEC DEBUG: Stdin io.Copy completed: %d bytes, error: %v", bytes, err)
-				close(done)
+				defer wg.Done()
+				defer ptyFile.Close()
+				klog.V(4).Infof("PTY stream goroutine: Starting bidirectional copy")
+
+				// Handle bidirectional copy between PTY and streams
+				done := make(chan struct{})
+
+				// Copy stdin to PTY
+				if stdin != nil {
+					go func() {
+						bytes, err := io.Copy(ptyFile, stdin)
+						klog.V(4).Infof("PTY stdin copy completed: %d bytes, error: %v", bytes, err)
+						done <- struct{}{}
+					}()
+				}
+
+				// Copy PTY to stdout
+				if stdout != nil {
+					go func() {
+						bytes, err := io.Copy(stdout, ptyFile)
+						klog.V(4).Infof("PTY stdout copy completed: %d bytes, error: %v", bytes, err)
+						done <- struct{}{}
+					}()
+				}
+
+				// Wait for either copy completion or context cancellation
+				select {
+				case <-done:
+					klog.V(4).Infof("PTY stream copy completed")
+				case <-ctx.Done():
+					klog.V(4).Infof("PTY stream goroutine: Cancelled by context")
+				}
+				klog.V(4).Infof("PTY stream goroutine: Exiting")
 			}()
-
-			// Wait for either copy completion or context cancellation
-			select {
-			case <-done:
-				klog.Infof("=== EXEC DEBUG: Stdin goroutine: Copy completed normally")
-			case <-ctx.Done():
-				klog.Infof("=== EXEC DEBUG: Stdin goroutine: Cancelled by context")
-			}
-			klog.Infof("=== EXEC DEBUG: Stdin goroutine: Exiting")
-		}()
-	}
-
-	// Handle command.stdout -> client stdout
-	if stdoutPipe != nil && stdout != nil {
-		streamCount++
-		wg.Add(1)
-		klog.Infof("=== EXEC DEBUG: Starting stdout goroutine (%d)", streamCount)
-		go func() {
-			defer wg.Done()
-			defer stdoutPipe.Close()
-			klog.Infof("=== EXEC DEBUG: Stdout goroutine: Starting with context cancellation")
-
-			// Use io.Copy but with context cancellation
-			done := make(chan struct{})
-			go func() {
-				bytes, err := io.Copy(stdout, stdoutPipe)
-				klog.Infof("=== EXEC DEBUG: Stdout io.Copy completed: %d bytes, error: %v", bytes, err)
-				close(done)
-			}()
-
-			// Wait for either copy completion or context cancellation
-			select {
-			case <-done:
-				klog.Infof("=== EXEC DEBUG: Stdout goroutine: Copy completed normally")
-			case <-ctx.Done():
-				klog.Infof("=== EXEC DEBUG: Stdout goroutine: Cancelled by context")
-			}
-			klog.Infof("=== EXEC DEBUG: Stdout goroutine: Exiting")
-		}()
-	}
-
-	// Handle command.stderr -> client stderr (only if not TTY)
-	if stderrPipe != nil && stderr != nil {
-		streamCount++
-		wg.Add(1)
-		klog.Infof("=== EXEC DEBUG: Starting stderr goroutine (%d)", streamCount)
-		go func() {
-			defer wg.Done()
-			defer stderrPipe.Close()
-			klog.Infof("=== EXEC DEBUG: Stderr goroutine: Starting with context cancellation")
-
-			// Use io.Copy but with context cancellation
-			done := make(chan struct{})
-			go func() {
-				bytes, err := io.Copy(stderr, stderrPipe)
-				klog.Infof("=== EXEC DEBUG: Stderr io.Copy completed: %d bytes, error: %v", bytes, err)
-				close(done)
-			}()
-
-			// Wait for either copy completion or context cancellation
-			select {
-			case <-done:
-				klog.Infof("=== EXEC DEBUG: Stderr goroutine: Copy completed normally")
-			case <-ctx.Done():
-				klog.Infof("=== EXEC DEBUG: Stderr goroutine: Cancelled by context")
-			}
-			klog.Infof("=== EXEC DEBUG: Stderr goroutine: Exiting")
-		}()
+		}
 	}
 
 	// Handle terminal resize events (for TTY mode)
 	if resizeChan != nil {
 		streamCount++
 		wg.Add(1)
-		klog.Infof("=== EXEC DEBUG: Starting resize goroutine (%d)", streamCount)
+		klog.V(4).Infof("Starting resize goroutine (%d)", streamCount)
 		go func() {
 			defer wg.Done()
 			defer func() {
-				klog.Infof("=== EXEC DEBUG: Resize goroutine: Exiting")
+				klog.V(4).Infof("Resize goroutine: Exiting")
 			}()
 
-			klog.Infof("=== EXEC DEBUG: Resize goroutine: Starting to listen for resize events")
+			klog.V(4).Infof("Resize goroutine: Starting to listen for resize events")
 			for {
 				select {
 				case size, ok := <-resizeChan:
 					if !ok {
-						klog.Infof("=== EXEC DEBUG: Resize channel closed")
+						klog.V(4).Infof("Resize channel closed")
 						return
 					}
-					klog.Infof("=== EXEC DEBUG: Processing resize event: %dx%d for podman exec PID %d", size.Width, size.Height, cmdPid)
+					klog.V(4).Infof("Processing resize event: %dx%d", size.Width, size.Height)
 
-					// Try to send SIGWINCH to the podman exec process to trigger resize
-					if err := s.signalPodmanExecResize(cmdPid, size.Width, size.Height); err != nil {
-						klog.Errorf("=== EXEC DEBUG: Failed to signal resize to podman exec: %v", err)
+					if tty && ptyFile != nil {
+						// For TTY mode, resize the PTY directly
+						winsize := &pty.Winsize{
+							Rows: uint16(size.Height),
+							Cols: uint16(size.Width),
+						}
+						if err := pty.Setsize(ptyFile, winsize); err != nil {
+							klog.Errorf("=== EXEC DEBUG: Failed to resize PTY: %v", err)
+						} else {
+							klog.V(4).Infof("Successfully resized PTY to %dx%d", size.Width, size.Height)
+
+							// Send SIGWINCH to podman exec so it detects the resize and propagates to container
+							if cmdPid > 0 {
+								if process, err := os.FindProcess(cmdPid); err != nil {
+									klog.Errorf("=== EXEC DEBUG: Failed to find podman exec process %d: %v", cmdPid, err)
+								} else if err := process.Signal(syscall.SIGWINCH); err != nil {
+									klog.Errorf("=== EXEC DEBUG: Failed to send SIGWINCH to podman exec %d: %v", cmdPid, err)
+								} else {
+									klog.V(4).Infof("Sent SIGWINCH to podman exec process %d", cmdPid)
+								}
+							}
+						}
 					} else {
-						klog.Infof("=== EXEC DEBUG: Successfully signaled resize to podman exec")
+						klog.V(4).Infof("Skipping resize - not in TTY mode or no PTY file")
 					}
 				case <-ctx.Done():
-					klog.Infof("=== EXEC DEBUG: Resize goroutine: Cancelled by context")
+					klog.V(4).Infof("Resize goroutine: Cancelled by context")
 					return
 				}
 			}
 		}()
 	}
 
-	klog.Infof("=== EXEC DEBUG: Started %d stream goroutines, waiting for command to complete", streamCount)
+	klog.V(4).Infof("Started %d stream goroutines, waiting for command to complete", streamCount)
 
 	// Wait for command to complete
-	klog.Infof("=== EXEC DEBUG: Waiting for command to finish")
+	klog.V(4).Infof("Waiting for command to finish")
 	cmdErr := cmd.Wait()
-	klog.Infof("=== EXEC DEBUG: Command finished with error: %v", cmdErr)
+	klog.V(4).Infof("Command finished with error: %v", cmdErr)
 
 	// Cancel context to signal goroutines to finish
-	klog.Infof("=== EXEC DEBUG: Cancelling context to signal goroutines to finish")
+	klog.V(4).Infof("Cancelling context to signal goroutines to finish")
 	cancel()
 
 	// Wait for all stream copying to complete
-	klog.Infof("=== EXEC DEBUG: Waiting for %d stream goroutines to complete", streamCount)
+	klog.V(4).Infof("Waiting for %d stream goroutines to complete", streamCount)
 	wg.Wait()
-	klog.Infof("=== EXEC DEBUG: All stream copying completed")
+	klog.V(4).Infof("All stream copying completed")
 
 	return cmdErr
 }
@@ -1650,173 +1657,22 @@ func (s *Server) handleResizeEvents(ctx context.Context, stream io.Reader, resiz
 	for {
 		var size TerminalSize
 		if err := decoder.Decode(&size); err != nil {
-			klog.Infof("=== EXEC DEBUG: Resize event decode error (expected at end): %v", err)
+			klog.V(4).Infof("Resize event decode error (expected at end): %v", err)
 			break
 		}
-		klog.Infof("=== EXEC DEBUG: Received terminal resize: %dx%d", size.Width, size.Height)
+		klog.V(4).Infof("Received terminal resize: %dx%d", size.Width, size.Height)
 
 		select {
 		case resizeChan <- size:
-			klog.Infof("=== EXEC DEBUG: Sent resize event to channel")
+			klog.V(4).Infof("Sent resize event to channel")
 		case <-ctx.Done():
-			klog.Infof("=== EXEC DEBUG: Resize handler cancelled by context")
+			klog.V(4).Infof("Resize handler cancelled by context")
 			return
 		}
 	}
-	klog.Infof("=== EXEC DEBUG: Resize event handler completed")
+	klog.V(4).Infof("Resize event handler completed")
 }
 
-// signalPodmanExecResize attempts to signal podman exec process for resize
-func (s *Server) signalPodmanExecResize(execPid int, width, height uint16) error {
-	klog.Infof("=== EXEC DEBUG: Signaling resize for podman exec PID %d to %dx%d", execPid, width, height)
-
-	// Try to find the actual container process that has the PTY
-	// First, let's try to find child processes of the podman exec
-	children, err := s.findProcessChildren(execPid)
-	if err != nil {
-		klog.Errorf("=== EXEC DEBUG: Failed to find children of PID %d: %v", execPid, err)
-		return err
-	}
-
-	klog.Infof("=== EXEC DEBUG: Found %d child processes of podman exec", len(children))
-
-	// Try to find a process that has a PTY
-	for _, childPid := range children {
-		if s.processHasPTY(childPid) {
-			klog.Infof("=== EXEC DEBUG: Found child process %d with PTY, trying to resize", childPid)
-			if err := s.resizePTYForProcess(childPid, width, height); err != nil {
-				klog.Errorf("=== EXEC DEBUG: Failed to resize PTY for process %d: %v", childPid, err)
-				continue
-			}
-			klog.Infof("=== EXEC DEBUG: Successfully resized PTY for process %d", childPid)
-			return nil
-		}
-	}
-
-	// If no child has PTY, try sending SIGWINCH to podman exec itself
-	klog.Infof("=== EXEC DEBUG: No child with PTY found, sending SIGWINCH to podman exec process %d", execPid)
-	process, err := os.FindProcess(execPid)
-	if err != nil {
-		return fmt.Errorf("failed to find podman exec process %d: %v", execPid, err)
-	}
-
-	if err := process.Signal(syscall.SIGWINCH); err != nil {
-		return fmt.Errorf("failed to send SIGWINCH to process %d: %v", execPid, err)
-	}
-
-	klog.Infof("=== EXEC DEBUG: Sent SIGWINCH to podman exec process %d", execPid)
-	return nil
-}
-
-// findProcessChildren finds child processes of a given PID
-func (s *Server) findProcessChildren(parentPid int) ([]int, error) {
-	var children []int
-
-	// Read all processes from /proc
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, err
-	}
-
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-
-		// Check if directory name is a number (PID)
-		pid := 0
-		if _, err := fmt.Sscanf(entry.Name(), "%d", &pid); err != nil {
-			continue
-		}
-
-		// Read the stat file to get parent PID
-		statPath := fmt.Sprintf("/proc/%d/stat", pid)
-		statData, err := os.ReadFile(statPath)
-		if err != nil {
-			continue
-		}
-
-		// Parse the stat file - PPID is the 4th field
-		fields := strings.Fields(string(statData))
-		if len(fields) < 4 {
-			continue
-		}
-
-		ppid := 0
-		if _, err := fmt.Sscanf(fields[3], "%d", &ppid); err != nil {
-			continue
-		}
-
-		if ppid == parentPid {
-			children = append(children, pid)
-		}
-	}
-
-	return children, nil
-}
-
-// processHasPTY checks if a process has a PTY by examining its file descriptors
-func (s *Server) processHasPTY(pid int) bool {
-	// Check if any of the standard file descriptors point to a PTY
-	for _, fdNum := range []string{"0", "1", "2"} {
-		fdPath := fmt.Sprintf("/proc/%d/fd/%s", pid, fdNum)
-
-		target, err := os.Readlink(fdPath)
-		if err != nil {
-			continue
-		}
-
-		if strings.HasPrefix(target, "/dev/pts/") {
-			klog.Infof("=== EXEC DEBUG: Process %d has PTY at %s -> %s", pid, fdPath, target)
-			return true
-		}
-	}
-	return false
-}
-
-// resizePTYForProcess resizes the PTY for a specific process
-func (s *Server) resizePTYForProcess(pid int, width, height uint16) error {
-	// Try each file descriptor to find the PTY
-	for _, fdNum := range []string{"0", "1", "2"} {
-		fdPath := fmt.Sprintf("/proc/%d/fd/%s", pid, fdNum)
-
-		target, err := os.Readlink(fdPath)
-		if err != nil {
-			continue
-		}
-
-		if strings.HasPrefix(target, "/dev/pts/") {
-			klog.Infof("=== EXEC DEBUG: Trying to resize PTY %s for process %d", target, pid)
-
-			// Open the PTY device directly
-			file, err := os.OpenFile(target, os.O_WRONLY, 0)
-			if err != nil {
-				klog.Errorf("=== EXEC DEBUG: Failed to open PTY device %s: %v", target, err)
-				continue
-			}
-			defer file.Close()
-
-			// Set the new window size using ioctl(TIOCSWINSZ)
-			fd := int(file.Fd())
-			newWs := winsize{
-				Row: height,
-				Col: width,
-				// Xpixel and Ypixel can be left as 0
-			}
-
-			_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(TIOCSWINSZ), uintptr(unsafe.Pointer(&newWs)))
-			if errno != 0 {
-				klog.Errorf("=== EXEC DEBUG: ioctl failed on %s: %v", target, errno)
-				continue
-			}
-
-			klog.Infof("=== EXEC DEBUG: Successfully resized PTY %s to %dx%d", target, width, height)
-			return nil
-		}
-	}
-
-	return fmt.Errorf("no PTY found for process %d", pid)
-}
 
 // handleWebSocketExec handles WebSocket-based exec requests (placeholder for now)
 func (s *Server) handleWebSocketExec(w http.ResponseWriter, r *http.Request, args []string, stdin, stdout, stderr, tty bool) {

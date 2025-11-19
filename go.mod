@@ -5,6 +5,7 @@ go 1.24.0
 toolchain go1.24.6
 
 require (
+	github.com/creack/pty v1.1.21
 	k8s.io/api v0.34.0
 	k8s.io/apimachinery v0.34.0
 	k8s.io/klog/v2 v2.130.1
