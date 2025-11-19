@@ -30,6 +30,12 @@ import (
 	"podman-k8s-adapter/pkg/storage"
 )
 
+// TerminalSize represents terminal dimensions
+type TerminalSize struct {
+	Width  uint16 `json:"width"`
+	Height uint16 `json:"height"`
+}
+
 // Server represents our Kubernetes API server
 type Server struct {
 	host       string
@@ -1177,6 +1183,8 @@ type connectionContext struct {
 	stdoutStream io.WriteCloser
 	stderrStream io.WriteCloser
 	writeStatus  func(status *apierrors.StatusError) error
+	resizeStream io.ReadCloser
+	resizeChan   chan TerminalSize
 	tty          bool
 }
 
@@ -1215,7 +1223,7 @@ func (s *Server) handleSPDYExec(w http.ResponseWriter, r *http.Request, args []s
 	defer ctx.conn.Close()
 
 	// Execute the command with established streams
-	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, tty)
+	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, tty, ctx.resizeChan)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
 			rc := exitErr.ProcessState.ExitCode()
@@ -1255,7 +1263,8 @@ func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *E
 		return nil, false
 	}
 
-	klog.Infof("Negotiated protocol: %s", protocol)
+	klog.Infof("=== EXEC DEBUG: Negotiated protocol: %s for TTY=%t, Stdin=%t, Stdout=%t, Stderr=%t",
+		protocol, opts.TTY, opts.Stdin, opts.Stdout, opts.Stderr)
 
 	streamCh := make(chan streamAndReply)
 
@@ -1272,7 +1281,7 @@ func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *E
 
 	conn.SetIdleTimeout(idleTimeout)
 
-	// Count expected streams (error stream + requested streams)
+	// Count expected streams (error stream + requested streams + resize stream for TTY)
 	expectedStreams := 1 // error stream is always expected
 	if opts.Stdin {
 		expectedStreams++
@@ -1282,6 +1291,9 @@ func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *E
 	}
 	if opts.Stderr {
 		expectedStreams++
+	}
+	if opts.TTY {
+		expectedStreams++ // resize stream for TTY mode
 	}
 
 	klog.Infof("Waiting for %d streams from client", expectedStreams)
@@ -1295,6 +1307,13 @@ func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *E
 	}
 
 	ctx.conn = conn
+
+	// Set up resize channel for TTY mode (following kubelet pattern)
+	if ctx.resizeStream != nil {
+		ctx.resizeChan = make(chan TerminalSize)
+		go s.handleResizeEvents(ctx.resizeStream, ctx.resizeChan)
+	}
+
 	return ctx, true
 }
 
@@ -1325,6 +1344,9 @@ func (s *Server) waitForStreams(streams <-chan streamAndReply, expectedStreams i
 			case corev1.StreamTypeStderr:
 				ctx.stderrStream = stream
 				go s.waitStreamReply(stream.replySent, replyChan)
+			case corev1.StreamTypeResize:
+				ctx.resizeStream = stream
+				go s.waitStreamReply(stream.replySent, replyChan)
 			default:
 				klog.Errorf("Unexpected stream type: %q", streamType)
 			}
@@ -1352,18 +1374,23 @@ func (s *Server) waitStreamReply(replySent <-chan struct{}, notify chan<- struct
 // createWriteStatusFunc creates a status writing function based on protocol version
 func (s *Server) createWriteStatusFunc(stream httpstream.Stream, protocol string) func(status *apierrors.StatusError) error {
 	return func(status *apierrors.StatusError) error {
-		defer stream.Close()
+		defer func() {
+			klog.Infof("=== EXEC DEBUG: Closing error stream after status write")
+			stream.Close()
+		}()
 
 		if status.Status().Status == metav1.StatusSuccess {
-			klog.Infof("Writing success status")
+			klog.Infof("=== EXEC DEBUG: Writing success status with protocol: %s", protocol)
 		} else {
-			klog.Infof("Writing error status: %s", status.Error())
+			klog.Infof("=== EXEC DEBUG: Writing error status: %s with protocol: %s", status.Error(), protocol)
 		}
 
 		// For v4+ protocols, write JSON status
 		if protocol == remotecommandconsts.StreamProtocolV4Name {
+			klog.Infof("=== EXEC DEBUG: Using v4 status writing")
 			return s.writeV4Status(stream, status)
 		} else {
+			klog.Infof("=== EXEC DEBUG: Using v1 status writing")
 			// For older protocols, write simple status
 			return s.writeV1Status(stream, status)
 		}
@@ -1374,8 +1401,10 @@ func (s *Server) createWriteStatusFunc(stream httpstream.Stream, protocol string
 func (s *Server) writeV4Status(stream httpstream.Stream, status *apierrors.StatusError) error {
 	statusBytes, err := json.Marshal(status.Status())
 	if err != nil {
+		klog.Errorf("=== EXEC DEBUG: v4 Failed to marshal status: %v", err)
 		return err
 	}
+	klog.Infof("=== EXEC DEBUG: v4 Writing JSON status to stream: %s", string(statusBytes))
 	_, err = stream.Write(statusBytes)
 	return err
 }
@@ -1383,14 +1412,16 @@ func (s *Server) writeV4Status(stream httpstream.Stream, status *apierrors.Statu
 // writeV1Status writes status in v1 protocol format (exit code)
 func (s *Server) writeV1Status(stream httpstream.Stream, status *apierrors.StatusError) error {
 	if status.Status().Status != metav1.StatusSuccess {
+		klog.Infof("=== EXEC DEBUG: v1 Writing error to stream: %s", status.Error())
 		_, err := stream.Write([]byte(status.Error()))
 		return err
 	}
+	klog.Infof("=== EXEC DEBUG: v1 Success status - not writing anything to error stream")
 	return nil
 }
 
 // execInContainer executes the command using the established streams (kubelet-style async stream handling)
-func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, stderr io.WriteCloser, tty bool) error {
+func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, stderr io.WriteCloser, tty bool, resizeChan <-chan TerminalSize) error {
 	klog.Infof("=== EXEC DEBUG: Starting execInContainer with args: %v", args)
 	klog.Infof("=== EXEC DEBUG: Stream setup - stdin: %t, stdout: %t, stderr: %t, tty: %t",
 		stdin != nil, stdout != nil, stderr != nil, tty)
@@ -1539,23 +1570,45 @@ func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, std
 
 	klog.Infof("=== EXEC DEBUG: Started %d stream goroutines, waiting for command to complete", streamCount)
 
-	// Wait for the command to complete
-	klog.Infof("=== EXEC DEBUG: Calling cmd.Wait()")
+	// Wait for command to complete
+	klog.Infof("=== EXEC DEBUG: Waiting for command to finish")
 	cmdErr := cmd.Wait()
-	klog.Infof("=== EXEC DEBUG: cmd.Wait() returned with error: %v", cmdErr)
+	klog.Infof("=== EXEC DEBUG: Command finished with error: %v", cmdErr)
 
-	// Cancel context to force all goroutines to exit
-	klog.Infof("=== EXEC DEBUG: Cancelling context to force goroutines to exit")
+	// Cancel context to signal goroutines to finish
+	klog.Infof("=== EXEC DEBUG: Cancelling context to signal goroutines to finish")
 	cancel()
 
-	// Wait for all stream copying to complete (should be fast now with cancellation)
+	// Wait for all stream copying to complete
 	klog.Infof("=== EXEC DEBUG: Waiting for %d stream goroutines to complete", streamCount)
 	wg.Wait()
-	klog.Infof("=== EXEC DEBUG: All stream copying completed, returning: %v", cmdErr)
+	klog.Infof("=== EXEC DEBUG: All stream copying completed")
 
 	return cmdErr
 }
 
+// handleResizeEvents handles terminal resize events (kubelet pattern)
+func (s *Server) handleResizeEvents(stream io.Reader, resizeChan chan<- TerminalSize) {
+	defer close(resizeChan)
+
+	decoder := json.NewDecoder(stream)
+	for {
+		var size TerminalSize
+		if err := decoder.Decode(&size); err != nil {
+			klog.Infof("=== EXEC DEBUG: Resize event decode error (expected at end): %v", err)
+			break
+		}
+		klog.Infof("=== EXEC DEBUG: Received terminal resize: %dx%d", size.Width, size.Height)
+
+		select {
+		case resizeChan <- size:
+			klog.Infof("=== EXEC DEBUG: Sent resize event to channel")
+		default:
+			klog.Infof("=== EXEC DEBUG: Resize channel full, dropping resize event")
+		}
+	}
+	klog.Infof("=== EXEC DEBUG: Resize event handler completed")
+}
 
 // handleWebSocketExec handles WebSocket-based exec requests (placeholder for now)
 func (s *Server) handleWebSocketExec(w http.ResponseWriter, r *http.Request, args []string, stdin, stdout, stderr, tty bool) {
