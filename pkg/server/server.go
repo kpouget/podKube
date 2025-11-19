@@ -14,10 +14,13 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -35,6 +38,20 @@ type TerminalSize struct {
 	Width  uint16 `json:"width"`
 	Height uint16 `json:"height"`
 }
+
+// winsize represents the terminal window size for ioctl calls
+type winsize struct {
+	Row    uint16
+	Col    uint16
+	Xpixel uint16
+	Ypixel uint16
+}
+
+// ioctl constants for terminal operations
+const (
+	TIOCGWINSZ = 0x5413
+	TIOCSWINSZ = 0x5414
+)
 
 // Server represents our Kubernetes API server
 type Server struct {
@@ -1223,6 +1240,7 @@ func (s *Server) handleSPDYExec(w http.ResponseWriter, r *http.Request, args []s
 	defer ctx.conn.Close()
 
 	// Execute the command with established streams
+	klog.Infof("=== EXEC DEBUG: About to call execInContainer with tty=%t", tty)
 	err := s.execInContainer(args, ctx.stdinStream, ctx.stdoutStream, ctx.stderrStream, tty, ctx.resizeChan)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ProcessState != nil {
@@ -1311,7 +1329,7 @@ func (s *Server) createStreams(req *http.Request, w http.ResponseWriter, opts *E
 	// Set up resize channel for TTY mode (following kubelet pattern)
 	if ctx.resizeStream != nil {
 		ctx.resizeChan = make(chan TerminalSize)
-		go s.handleResizeEvents(ctx.resizeStream, ctx.resizeChan)
+		go s.handleResizeEvents(req.Context(), ctx.resizeStream, ctx.resizeChan)
 	}
 
 	return ctx, true
@@ -1423,14 +1441,15 @@ func (s *Server) writeV1Status(stream httpstream.Stream, status *apierrors.Statu
 // execInContainer executes the command using the established streams (kubelet-style async stream handling)
 func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, stderr io.WriteCloser, tty bool, resizeChan <-chan TerminalSize) error {
 	klog.Infof("=== EXEC DEBUG: Starting execInContainer with args: %v", args)
-	klog.Infof("=== EXEC DEBUG: Stream setup - stdin: %t, stdout: %t, stderr: %t, tty: %t",
-		stdin != nil, stdout != nil, stderr != nil, tty)
+	klog.Infof("=== EXEC DEBUG: Stream setup - stdin: %t, stdout: %t, stderr: %t, tty: %t, resize: %t",
+		stdin != nil, stdout != nil, stderr != nil, tty, resizeChan != nil)
 
 	// Create context to cancel goroutines when command completes
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	cmd := exec.Command("podman", args...)
+	var cmdPid int // Store the podman exec process PID for resize handling
 
 	// Set up pipes for all streams
 	var stdinPipe io.WriteCloser
@@ -1475,7 +1494,8 @@ func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, std
 		klog.Errorf("=== EXEC DEBUG: Failed to start command: %v", err)
 		return err
 	}
-	klog.Infof("=== EXEC DEBUG: Podman command started successfully, PID: %d", cmd.Process.Pid)
+	cmdPid = cmd.Process.Pid
+	klog.Infof("=== EXEC DEBUG: Podman exec command started successfully, PID: %d", cmdPid)
 
 	// Handle streams asynchronously (kubelet pattern)
 	var wg sync.WaitGroup
@@ -1568,6 +1588,41 @@ func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, std
 		}()
 	}
 
+	// Handle terminal resize events (for TTY mode)
+	if resizeChan != nil {
+		streamCount++
+		wg.Add(1)
+		klog.Infof("=== EXEC DEBUG: Starting resize goroutine (%d)", streamCount)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				klog.Infof("=== EXEC DEBUG: Resize goroutine: Exiting")
+			}()
+
+			klog.Infof("=== EXEC DEBUG: Resize goroutine: Starting to listen for resize events")
+			for {
+				select {
+				case size, ok := <-resizeChan:
+					if !ok {
+						klog.Infof("=== EXEC DEBUG: Resize channel closed")
+						return
+					}
+					klog.Infof("=== EXEC DEBUG: Processing resize event: %dx%d for podman exec PID %d", size.Width, size.Height, cmdPid)
+
+					// Try to send SIGWINCH to the podman exec process to trigger resize
+					if err := s.signalPodmanExecResize(cmdPid, size.Width, size.Height); err != nil {
+						klog.Errorf("=== EXEC DEBUG: Failed to signal resize to podman exec: %v", err)
+					} else {
+						klog.Infof("=== EXEC DEBUG: Successfully signaled resize to podman exec")
+					}
+				case <-ctx.Done():
+					klog.Infof("=== EXEC DEBUG: Resize goroutine: Cancelled by context")
+					return
+				}
+			}
+		}()
+	}
+
 	klog.Infof("=== EXEC DEBUG: Started %d stream goroutines, waiting for command to complete", streamCount)
 
 	// Wait for command to complete
@@ -1588,7 +1643,7 @@ func (s *Server) execInContainer(args []string, stdin io.ReadCloser, stdout, std
 }
 
 // handleResizeEvents handles terminal resize events (kubelet pattern)
-func (s *Server) handleResizeEvents(stream io.Reader, resizeChan chan<- TerminalSize) {
+func (s *Server) handleResizeEvents(ctx context.Context, stream io.Reader, resizeChan chan<- TerminalSize) {
 	defer close(resizeChan)
 
 	decoder := json.NewDecoder(stream)
@@ -1603,11 +1658,164 @@ func (s *Server) handleResizeEvents(stream io.Reader, resizeChan chan<- Terminal
 		select {
 		case resizeChan <- size:
 			klog.Infof("=== EXEC DEBUG: Sent resize event to channel")
-		default:
-			klog.Infof("=== EXEC DEBUG: Resize channel full, dropping resize event")
+		case <-ctx.Done():
+			klog.Infof("=== EXEC DEBUG: Resize handler cancelled by context")
+			return
 		}
 	}
 	klog.Infof("=== EXEC DEBUG: Resize event handler completed")
+}
+
+// signalPodmanExecResize attempts to signal podman exec process for resize
+func (s *Server) signalPodmanExecResize(execPid int, width, height uint16) error {
+	klog.Infof("=== EXEC DEBUG: Signaling resize for podman exec PID %d to %dx%d", execPid, width, height)
+
+	// Try to find the actual container process that has the PTY
+	// First, let's try to find child processes of the podman exec
+	children, err := s.findProcessChildren(execPid)
+	if err != nil {
+		klog.Errorf("=== EXEC DEBUG: Failed to find children of PID %d: %v", execPid, err)
+		return err
+	}
+
+	klog.Infof("=== EXEC DEBUG: Found %d child processes of podman exec", len(children))
+
+	// Try to find a process that has a PTY
+	for _, childPid := range children {
+		if s.processHasPTY(childPid) {
+			klog.Infof("=== EXEC DEBUG: Found child process %d with PTY, trying to resize", childPid)
+			if err := s.resizePTYForProcess(childPid, width, height); err != nil {
+				klog.Errorf("=== EXEC DEBUG: Failed to resize PTY for process %d: %v", childPid, err)
+				continue
+			}
+			klog.Infof("=== EXEC DEBUG: Successfully resized PTY for process %d", childPid)
+			return nil
+		}
+	}
+
+	// If no child has PTY, try sending SIGWINCH to podman exec itself
+	klog.Infof("=== EXEC DEBUG: No child with PTY found, sending SIGWINCH to podman exec process %d", execPid)
+	process, err := os.FindProcess(execPid)
+	if err != nil {
+		return fmt.Errorf("failed to find podman exec process %d: %v", execPid, err)
+	}
+
+	if err := process.Signal(syscall.SIGWINCH); err != nil {
+		return fmt.Errorf("failed to send SIGWINCH to process %d: %v", execPid, err)
+	}
+
+	klog.Infof("=== EXEC DEBUG: Sent SIGWINCH to podman exec process %d", execPid)
+	return nil
+}
+
+// findProcessChildren finds child processes of a given PID
+func (s *Server) findProcessChildren(parentPid int) ([]int, error) {
+	var children []int
+
+	// Read all processes from /proc
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Check if directory name is a number (PID)
+		pid := 0
+		if _, err := fmt.Sscanf(entry.Name(), "%d", &pid); err != nil {
+			continue
+		}
+
+		// Read the stat file to get parent PID
+		statPath := fmt.Sprintf("/proc/%d/stat", pid)
+		statData, err := os.ReadFile(statPath)
+		if err != nil {
+			continue
+		}
+
+		// Parse the stat file - PPID is the 4th field
+		fields := strings.Fields(string(statData))
+		if len(fields) < 4 {
+			continue
+		}
+
+		ppid := 0
+		if _, err := fmt.Sscanf(fields[3], "%d", &ppid); err != nil {
+			continue
+		}
+
+		if ppid == parentPid {
+			children = append(children, pid)
+		}
+	}
+
+	return children, nil
+}
+
+// processHasPTY checks if a process has a PTY by examining its file descriptors
+func (s *Server) processHasPTY(pid int) bool {
+	// Check if any of the standard file descriptors point to a PTY
+	for _, fdNum := range []string{"0", "1", "2"} {
+		fdPath := fmt.Sprintf("/proc/%d/fd/%s", pid, fdNum)
+
+		target, err := os.Readlink(fdPath)
+		if err != nil {
+			continue
+		}
+
+		if strings.HasPrefix(target, "/dev/pts/") {
+			klog.Infof("=== EXEC DEBUG: Process %d has PTY at %s -> %s", pid, fdPath, target)
+			return true
+		}
+	}
+	return false
+}
+
+// resizePTYForProcess resizes the PTY for a specific process
+func (s *Server) resizePTYForProcess(pid int, width, height uint16) error {
+	// Try each file descriptor to find the PTY
+	for _, fdNum := range []string{"0", "1", "2"} {
+		fdPath := fmt.Sprintf("/proc/%d/fd/%s", pid, fdNum)
+
+		target, err := os.Readlink(fdPath)
+		if err != nil {
+			continue
+		}
+
+		if strings.HasPrefix(target, "/dev/pts/") {
+			klog.Infof("=== EXEC DEBUG: Trying to resize PTY %s for process %d", target, pid)
+
+			// Open the PTY device directly
+			file, err := os.OpenFile(target, os.O_WRONLY, 0)
+			if err != nil {
+				klog.Errorf("=== EXEC DEBUG: Failed to open PTY device %s: %v", target, err)
+				continue
+			}
+			defer file.Close()
+
+			// Set the new window size using ioctl(TIOCSWINSZ)
+			fd := int(file.Fd())
+			newWs := winsize{
+				Row: height,
+				Col: width,
+				// Xpixel and Ypixel can be left as 0
+			}
+
+			_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(TIOCSWINSZ), uintptr(unsafe.Pointer(&newWs)))
+			if errno != 0 {
+				klog.Errorf("=== EXEC DEBUG: ioctl failed on %s: %v", target, errno)
+				continue
+			}
+
+			klog.Infof("=== EXEC DEBUG: Successfully resized PTY %s to %dx%d", target, width, height)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no PTY found for process %d", pid)
 }
 
 // handleWebSocketExec handles WebSocket-based exec requests (placeholder for now)
@@ -1834,3 +2042,4 @@ func (s *Server) generateSelfSignedCert() (tls.Certificate, error) {
 
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
+
