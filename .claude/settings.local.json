@@ -11,7 +11,22 @@
       "Bash(find:*)",
       "Bash(GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache go build:*)",
       "Bash(GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache go mod tidy:*)",
-      "Bash(make status:*)"
+      "Bash(make status:*)",
+      "Bash(podman ps:*)",
+      "Bash(podman inspect:*)",
+      "Bash(oc get:*)",
+      "Bash(curl:*)",
+      "Bash(timeout 10s oc exec:*)",
+      "Bash(timeout 15s oc debug:*)",
+      "Bash(timeout 5s oc exec:*)",
+      "Bash(timeout 20s oc debug:*)",
+      "Bash(podman logs:*)",
+      "Bash(go get:*)",
+      "Bash(go build:*)",
+      "Bash(go test:*)",
+      "Bash(make test-prereqs:*)",
+      "Bash(make:*)",
+      "Bash(tree:*)"
     ],
     "deny": [],
     "ask": []
